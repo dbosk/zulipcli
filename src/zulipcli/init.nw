@@ -1,0 +1,59 @@
+\chapter{The zulipcli package}
+
+The Zulip Python API provides a powerful [[Client]] class for interacting
+with a Zulip server, but the official command-line tools ([[zulip-api]],
+[[zulip-send]]) expose only a fraction of its capabilities.
+Most notably, there is no way to list users from the command line---which
+makes it hard to discover the email addresses that [[zulip-send]] requires.
+
+This package wraps the Zulip client and provides a more complete
+command-line interface.
+The package itself exposes a single factory function, [[get_client]],
+so that both the CLI and any other Python code can obtain a configured
+client without duplicating the setup logic.
+
+\section{Package structure}
+
+<<[[__init__.py]]>>=
+"""Zulip API client wrapper for the zulipcli package."""
+
+<<imports>>
+<<constants>>
+<<functions>>
+@
+
+\section{Client creation}
+
+The Zulip client reads credentials from a \texttt{zuliprc} file,
+typically located at \texttt{\~{}/.zuliprc}.
+We default to that path but allow callers to override it---the CLI
+uses this to support its \texttt{-{}-zuliprc} flag.
+
+We chose not to cache the client as a module-level singleton because
+the CLI only creates one client per invocation anyway, and caching
+would complicate testing (stale state between test runs).
+
+<<imports>>=
+import os
+import zulip
+@
+
+<<constants>>=
+DEFAULT_ZULIPRC = os.path.expanduser("~/.zuliprc")
+@
+
+<<functions>>=
+def get_client(zuliprc=None):
+    """Create and return a configured Zulip API client.
+
+    Args:
+        zuliprc: Path to a zuliprc configuration file.
+            Defaults to ``~/.zuliprc``.
+
+    Returns:
+        A ``zulip.Client`` instance ready for API calls.
+    """
+    if zuliprc is None:
+        zuliprc = DEFAULT_ZULIPRC
+    return zulip.Client(config_file=zuliprc)
+@

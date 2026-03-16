@@ -1,0 +1,494 @@
+\chapter{The command-line interface}
+
+The official Zulip CLI tools---[[zulip-api]] and [[zulip-send]]---cover
+message sending and a handful of administrative operations, but lack
+basic discovery commands.
+When we need to send a direct message with [[zulip-send]], we must
+already know the recipient's email address; there is no built-in way to
+look it up.
+Similarly, there is no command to list the available streams (channels).
+
+The [[zulipcli]] command fills these gaps with three subcommands:
+\begin{description}
+\item[users] List users, optionally filtered by a name or email
+  pattern.
+\item[send] Send a message to a stream or directly to a user.
+\item[streams] List available streams.
+\end{description}
+
+We use the subcommand pattern familiar from Git and the
+[[canvaslms]] tool: each subcommand registers itself on an argparse
+subparser via an [[add_X_command]] function, and implements its logic
+in an [[X_command]] function.
+
+
+\section{Program structure}
+
+<<[[cli.py]]>>=
+"""Command-line interface for Zulip."""
+
+import argparse
+import re
+import sys
+
+import zulipcli
+
+<<functions>>
+
+def main():
+    """Entry point for the zulipcli command."""
+    <<set up argument parser>>
+    <<parse arguments and dispatch>>
+@
+
+
+\section{Argument parsing}
+
+The top-level parser accepts a \texttt{-{}-zuliprc} option to override the
+default configuration file path.
+Each subcommand then adds its own flags and positional arguments.
+
+<<set up argument parser>>=
+parser = argparse.ArgumentParser(
+    prog="zulipcli",
+    description="Command-line interface for Zulip"
+)
+parser.add_argument(
+    "--zuliprc",
+    default=None,
+    help="path to zuliprc config file (default: ~/.zuliprc)"
+)
+subparsers = parser.add_subparsers(dest="command")
+<<register subcommands>>
+@
+
+We register all subcommands here.
+Adding a new subcommand later means adding one line here and one
+section below---the rest of the structure stays untouched.
+
+<<register subcommands>>=
+add_users_command(subparsers)
+add_send_command(subparsers)
+add_streams_command(subparsers)
+@
+
+After parsing, we create the Zulip client and dispatch to the
+subcommand's handler function.
+If no subcommand was given, we print the help text---this is more
+useful than a cryptic error about a missing attribute.
+
+<<parse arguments and dispatch>>=
+args = parser.parse_args()
+if not hasattr(args, "func") or args.func is None:
+    parser.print_help()
+    sys.exit(1)
+client = zulipcli.get_client(args.zuliprc)
+args.func(client, args)
+@
+
+
+\section{The \texttt{users} subcommand}
+\label{sec:users}
+
+This is the primary motivation for the tool.
+The Zulip API method [[get_members]] returns a list of all users on the
+server, each with fields like [[full_name]], [[email]], [[user_id]],
+[[is_bot]], and [[is_active]].
+
+We output users as tab-separated lines (name, email) so the output is
+easy to pipe through standard Unix tools like [[grep]], [[cut]], and
+[[sort]].
+By default we exclude bots and deactivated users, since the common use
+case is finding a human colleague's email address.
+
+<<functions>>=
+def add_users_command(subparsers):
+    """Register the users subcommand."""
+    p = subparsers.add_parser(
+        "users",
+        help="list users on the Zulip server"
+    )
+    p.add_argument(
+        "pattern",
+        nargs="?",
+        default=None,
+        help="filter users by name or email (regex)"
+    )
+    p.add_argument(
+        "--include-bots",
+        action="store_true",
+        default=False,
+        help="include bot accounts in output"
+    )
+    p.add_argument(
+        "--include-deactivated",
+        action="store_true",
+        default=False,
+        help="include deactivated accounts in output"
+    )
+    p.set_defaults(func=users_command)
+@
+
+The implementation fetches all members, applies the filters, and prints
+each matching user.
+We compile the pattern once (if given) and match it case-insensitively
+against both the full name and the email address, so that
+[[zulipcli users bosk]] finds both \enquote{Daniel Bosk} and
+\enquote{dbosk@example.com}.
+
+<<functions>>=
+def users_command(client, args):
+    """List users, optionally filtered by pattern."""
+    result = client.get_members()
+    if result["result"] != "success":
+        print(f"Error: {result.get('msg', 'unknown error')}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.pattern:
+        pattern = re.compile(args.pattern, re.IGNORECASE)
+    else:
+        pattern = None
+
+    for member in sorted(result["members"],
+                         key=lambda m: m["full_name"]):
+        <<skip filtered users>>
+        print(f"{member['full_name']}\t{member['email']}")
+@
+
+We skip users that don't match the active filters.
+The order matters: we check the cheapest conditions first (boolean
+flags) before the more expensive regex match.
+
+<<skip filtered users>>=
+if not args.include_bots and member.get("is_bot", False):
+    continue
+if not args.include_deactivated \
+        and not member.get("is_active", True):
+    continue
+if pattern and not (pattern.search(member["full_name"])
+                    or pattern.search(member["email"])):
+    continue
+@
+
+Let's verify that the filtering logic works correctly.
+We create mock API responses and check that bots and deactivated users
+are excluded by default, and that the pattern filter matches against
+both name and email fields.
+
+<<test [[cli.py]]>>=
+"""Tests for zulipcli.cli."""
+import argparse
+import re
+
+from unittest.mock import MagicMock
+
+from zulipcli.cli import users_command
+
+<<test functions>>
+@
+
+<<test functions>>=
+def _make_members():
+    """Create a sample member list for testing."""
+    return {
+        "result": "success",
+        "members": [
+            {
+                "full_name": "Alice Admin",
+                "email": "alice@example.com",
+                "is_bot": False,
+                "is_active": True,
+            },
+            {
+                "full_name": "Bob Bot",
+                "email": "bob-bot@example.com",
+                "is_bot": True,
+                "is_active": True,
+            },
+            {
+                "full_name": "Charlie Inactive",
+                "email": "charlie@example.com",
+                "is_bot": False,
+                "is_active": False,
+            },
+            {
+                "full_name": "Diana Developer",
+                "email": "diana@example.com",
+                "is_bot": False,
+                "is_active": True,
+            },
+        ],
+    }
+@
+
+<<test functions>>=
+def test_users_excludes_bots_by_default(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = argparse.Namespace(
+        pattern=None,
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_command(client, args)
+    output = capsys.readouterr().out
+    assert "Alice Admin" in output
+    assert "Bob Bot" not in output
+@
+
+<<test functions>>=
+def test_users_excludes_deactivated_by_default(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = argparse.Namespace(
+        pattern=None,
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_command(client, args)
+    output = capsys.readouterr().out
+    assert "Alice Admin" in output
+    assert "Charlie Inactive" not in output
+@
+
+<<test functions>>=
+def test_users_pattern_filters_by_name(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = argparse.Namespace(
+        pattern="diana",
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_command(client, args)
+    output = capsys.readouterr().out
+    assert "Diana Developer" in output
+    assert "Alice Admin" not in output
+@
+
+<<test functions>>=
+def test_users_pattern_filters_by_email(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = argparse.Namespace(
+        pattern="alice@",
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_command(client, args)
+    output = capsys.readouterr().out
+    assert "Alice Admin" in output
+    assert "Diana Developer" not in output
+@
+
+<<test functions>>=
+def test_users_include_bots(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = argparse.Namespace(
+        pattern=None,
+        include_bots=True,
+        include_deactivated=False,
+    )
+    users_command(client, args)
+    output = capsys.readouterr().out
+    assert "Bob Bot" in output
+@
+
+
+\section{The \texttt{send} subcommand}
+
+The [[send]] subcommand wraps [[client.send_message()]].
+It supports two modes: stream messages (requiring \texttt{-{}-stream}
+and \texttt{-{}-topic}) and direct messages (requiring \texttt{-{}-to}).
+
+We accept the message body either as a positional argument or from
+standard input.
+Reading from stdin is useful for piping output from other commands
+directly into a Zulip message, which is a common scripting pattern.
+
+<<functions>>=
+def add_send_command(subparsers):
+    """Register the send subcommand."""
+    p = subparsers.add_parser(
+        "send",
+        help="send a message"
+    )
+    p.add_argument(
+        "--stream", "-s",
+        default=None,
+        help="destination stream (channel) name"
+    )
+    p.add_argument(
+        "--topic", "-t",
+        default=None,
+        help="topic within the stream"
+    )
+    p.add_argument(
+        "--to",
+        default=None,
+        help="recipient email for direct messages"
+    )
+    p.add_argument(
+        "message",
+        nargs="?",
+        default=None,
+        help="message content (reads stdin if omitted)"
+    )
+    p.set_defaults(func=send_command)
+@
+
+The Zulip API distinguishes between [[stream]] messages (sent to a
+channel and topic) and [[direct]] messages (sent to one or more users
+by email).
+We require exactly one of these two modes and report an error if the
+user provides neither or both.
+
+<<functions>>=
+def send_command(client, args):
+    """Send a message to a stream or directly to a user."""
+    content = args.message
+    if content is None:
+        content = sys.stdin.read()
+
+    if args.stream:
+        <<send stream message>>
+    elif args.to:
+        <<send direct message>>
+    else:
+        print("Error: specify --stream/--topic or --to",
+              file=sys.stderr)
+        sys.exit(1)
+@
+
+For stream messages, a topic is required---Zulip enforces this on the
+server side, but we catch it early to give a clearer error message.
+
+<<send stream message>>=
+if not args.topic:
+    print("Error: --topic is required with --stream",
+          file=sys.stderr)
+    sys.exit(1)
+request = {
+    "type": "stream",
+    "to": args.stream,
+    "topic": args.topic,
+    "content": content,
+}
+result = client.send_message(request)
+if result["result"] != "success":
+    print(f"Error: {result.get('msg', 'unknown error')}",
+          file=sys.stderr)
+    sys.exit(1)
+@
+
+Direct messages use the [[direct]] type (called [[private]] in older
+API versions).
+The [[to]] field accepts a list of email addresses; we support a
+single recipient for simplicity.
+
+<<send direct message>>=
+request = {
+    "type": "direct",
+    "to": [args.to],
+    "content": content,
+}
+result = client.send_message(request)
+if result["result"] != "success":
+    print(f"Error: {result.get('msg', 'unknown error')}",
+          file=sys.stderr)
+    sys.exit(1)
+@
+
+
+\section{The \texttt{streams} subcommand}
+
+The [[streams]] subcommand lists all streams (channels) on the server.
+This is useful for discovering where to send messages---particularly
+on a server with many streams where the web interface's sidebar
+becomes unwieldy.
+
+<<functions>>=
+def add_streams_command(subparsers):
+    """Register the streams subcommand."""
+    p = subparsers.add_parser(
+        "streams",
+        help="list available streams (channels)"
+    )
+    p.add_argument(
+        "pattern",
+        nargs="?",
+        default=None,
+        help="filter streams by name (regex)"
+    )
+    p.set_defaults(func=streams_command)
+@
+
+Like the [[users]] command, we support an optional regex pattern for
+filtering and sort the output alphabetically for readability.
+
+<<functions>>=
+def streams_command(client, args):
+    """List available streams."""
+    result = client.get_streams()
+    if result["result"] != "success":
+        print(f"Error: {result.get('msg', 'unknown error')}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if args.pattern:
+        pattern = re.compile(args.pattern, re.IGNORECASE)
+    else:
+        pattern = None
+
+    for stream in sorted(result["streams"],
+                         key=lambda s: s["name"]):
+        if pattern and not pattern.search(stream["name"]):
+            continue
+        print(stream["name"])
+@
+
+Let's verify the streams command filters correctly.
+
+<<test functions>>=
+def test_streams_lists_all(capsys):
+    from zulipcli.cli import streams_command
+
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [
+            {"name": "general"},
+            {"name": "random"},
+            {"name": "announcements"},
+        ],
+    }
+    args = argparse.Namespace(pattern=None)
+    streams_command(client, args)
+    output = capsys.readouterr().out
+    lines = output.strip().split("\n")
+    assert lines == ["announcements", "general", "random"]
+@
+
+<<test functions>>=
+def test_streams_filters_by_pattern(capsys):
+    from zulipcli.cli import streams_command
+
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [
+            {"name": "general"},
+            {"name": "random"},
+            {"name": "announcements"},
+        ],
+    }
+    args = argparse.Namespace(pattern="an")
+    streams_command(client, args)
+    output = capsys.readouterr().out
+    lines = output.strip().split("\n")
+    assert "random" in lines
+    assert "announcements" in lines
+    assert "general" not in lines
+@
