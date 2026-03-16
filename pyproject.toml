@@ -1,0 +1,37 @@
+[project]
+name = "zulipcli"
+version = "0.1"
+description = "Command-line interface for Zulip"
+authors = [
+  {name = "Daniel Bosk", email = "daniel@bosk.se"}
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "zulip"
+]
+
+[project.scripts]
+zulipcli = "zulipcli.cli:main"
+
+[tool.poetry]
+packages = [{include = "zulipcli", from = "src"}]
+include = [
+  { path = "src/**/*.py", format = "wheel" }
+]
+exclude = [
+  "*/**/.gitignore",
+  { path = "*/**/Makefile", format = "wheel" },
+  "*/**/ltxobj",
+  "*/**/.git"
+]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+test = [
+    "pytest (>=9.0.2,<10.0.0)"
+]
