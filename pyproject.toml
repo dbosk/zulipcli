@@ -9,11 +9,8 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "zulip"
-]
-
-[project.optional-dependencies]
-rich = [
+  "zulip",
+  "typer",
   "rich"
 ]
 
