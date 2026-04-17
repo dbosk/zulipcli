@@ -134,46 +134,18 @@ as completion output.
 If the client cannot be created or a Zulip API request fails, we simply
 return no candidates.
 
-The raw command-line arguments are also available during completion.
-That lets us recover the top-level [[--zuliprc]] override and even the
-selected stream for [[send --topic]], where the user might supply
-[[--stream]] before or after [[--topic]].
+Typer also gives completion callbacks the parsed command context.
+That is enough for this CLI: the root context carries the top-level
+[[--zuliprc]] override, and the active command context already contains
+the selected stream for [[read TOPIC]] and [[send --topic TOPIC]].
 
 <<functions>>=
-def _get_zuliprc_from_args(args: list[str]):
-    """Extract the zuliprc override from raw completion arguments."""
-    for index, arg in enumerate(args):
-        if arg == "--zuliprc":
-            if index + 1 < len(args):
-                return args[index + 1]
-            return None
-        if arg.startswith("--zuliprc="):
-            return arg.split("=", 1)[1]
-    return None
-@
-
-<<functions>>=
-def _get_stream_from_args(ctx: typer.Context, args: list[str]):
-    """Return the selected stream from parsed params or raw args."""
-    stream = ctx.params.get("stream")
-    if stream:
-        return stream
-
-    for index, arg in enumerate(args):
-        if arg in {"--stream", "-s"}:
-            if index + 1 < len(args):
-                return args[index + 1]
-            return None
-        if arg.startswith("--stream="):
-            return arg.split("=", 1)[1]
-    return None
-@
-
-<<functions>>=
-def _get_completion_client(args: list[str]):
+def _get_completion_client(ctx: typer.Context):
     """Create a Zulip client for shell completion lookups."""
+    root_ctx = ctx.find_root()
+    zuliprc = (root_ctx.params or {}).get("zuliprc")
     try:
-        return zulipcli.get_client(_get_zuliprc_from_args(args))
+        return zulipcli.get_client(zuliprc)
     except Exception:
         return None
 @
@@ -187,9 +159,9 @@ def _matches_completion(candidate: str, incomplete: str):
 @
 
 <<functions>>=
-def complete_stream_names(args: list[str], incomplete: str):
+def complete_stream_names(ctx: typer.Context, incomplete: str):
     """Autocomplete stream names."""
-    client = _get_completion_client(args)
+    client = _get_completion_client(ctx)
     if client is None:
         return []
 
@@ -213,17 +185,13 @@ That same callback serves both [[read STREAM TOPIC]] and
 [[send --stream STREAM --topic TOPIC]].
 
 <<functions>>=
-def complete_topic_names(
-    ctx: typer.Context,
-    args: list[str],
-    incomplete: str,
-):
+def complete_topic_names(ctx: typer.Context, incomplete: str):
     """Autocomplete topic names for the selected stream."""
-    stream = _get_stream_from_args(ctx, args)
+    stream = ctx.params.get("stream")
     if not stream:
         return []
 
-    client = _get_completion_client(args)
+    client = _get_completion_client(ctx)
     if client is None:
         return []
 
@@ -252,9 +220,9 @@ We therefore return the email as the value and the full name as the help
 text for shells that can display it.
 
 <<functions>>=
-def complete_user_emails(args: list[str], incomplete: str):
+def complete_user_emails(ctx: typer.Context, incomplete: str):
     """Autocomplete direct-message recipients."""
-    client = _get_completion_client(args)
+    client = _get_completion_client(ctx)
     if client is None:
         return []
 
@@ -293,6 +261,8 @@ import io
 from types import SimpleNamespace
 
 import pytest
+from click.shell_completion import _resolve_context, _resolve_incomplete
+from typer.main import get_command
 from typer.testing import CliRunner
 from unittest.mock import MagicMock
 
@@ -360,7 +330,9 @@ def test_stream_completion_uses_zuliprc_override(monkeypatch):
 
     monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
     assert complete_stream_names(
-        ["--zuliprc", "/tmp/custom.zuliprc", "read", "g"],
+        SimpleNamespace(find_root=lambda: SimpleNamespace(
+            params={"zuliprc": "/tmp/custom.zuliprc"},
+        )),
         "g",
     ) == ["general"]
     assert seen["zuliprc"] == "/tmp/custom.zuliprc"
@@ -378,7 +350,10 @@ def test_stream_completion_silently_ignores_lookup_errors(monkeypatch):
         "get_client",
         lambda zuliprc=None: client,
     )
-    assert complete_stream_names(["streams", "g"], "g") == []
+    assert complete_stream_names(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+        "g",
+    ) == []
 @
 
 
@@ -1328,7 +1303,8 @@ def test_read_reports_history_errors(capsys):
 @
 
 We can also verify the remaining completion cases: topics for a selected
-stream and direct-message recipients with full-name help text.
+stream, direct-message recipients with full-name help text, and the
+actual Click completion entry path that Typer uses at runtime.
 
 <<test functions>>=
 def test_topic_completion_uses_stream_from_context(monkeypatch):
@@ -1351,8 +1327,10 @@ def test_topic_completion_uses_stream_from_context(monkeypatch):
     )
 
     result = complete_topic_names(
-        SimpleNamespace(params={"stream": "general"}),
-        ["read", "general", "A"],
+        SimpleNamespace(
+            params={"stream": "general"},
+            find_root=lambda: SimpleNamespace(params={}),
+        ),
         "A",
     )
 
@@ -1362,32 +1340,22 @@ def test_topic_completion_uses_stream_from_context(monkeypatch):
 @
 
 <<test functions>>=
-def test_topic_completion_reads_send_stream_from_raw_args(monkeypatch):
+def test_topic_completion_silently_ignores_missing_stream(monkeypatch):
     client = MagicMock()
-    client.get_stream_id.return_value = {
-        "result": "success",
-        "stream_id": 17,
-    }
-    client.get_stream_topics.return_value = {
-        "result": "success",
-        "topics": [
-            {"name": "Announcements"},
-            {"name": "Lab 1"},
-        ],
-    }
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
         lambda zuliprc=None: client,
     )
 
-    result = complete_topic_names(
-        SimpleNamespace(params={}),
-        ["send", "--stream", "general", "--topic", "A"],
+    assert complete_topic_names(
+        SimpleNamespace(
+            params={},
+            find_root=lambda: SimpleNamespace(params={}),
+        ),
         "A",
-    )
-
-    assert result == ["Announcements"]
+    ) == []
+    client.get_stream_id.assert_not_called()
 @
 
 <<test functions>>=
@@ -1414,7 +1382,65 @@ def test_user_completion_returns_email_with_full_name(monkeypatch):
         lambda zuliprc=None: client,
     )
 
-    assert complete_user_emails(["send", "--to", "ali"], "ali") == [
-        ("alice@example.com", "Alice Admin")
-    ]
+    assert complete_user_emails(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+        "ali",
+    ) == [("alice@example.com", "Alice Admin")]
+@
+
+<<test functions>>=
+def test_click_completion_path_uses_context_for_zuliprc_and_stream(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "success",
+        "topics": [
+            {"name": "Announcements"},
+            {"name": "Lab 1"},
+        ],
+    }
+    seen = {}
+
+    def get_client(zuliprc=None):
+        seen["zuliprc"] = zuliprc
+        return client
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+
+    command = get_command(app)
+    context = _resolve_context(
+        command,
+        {},
+        "zulipcli",
+        [
+            "--zuliprc",
+            "/tmp/custom.zuliprc",
+            "send",
+            "--stream",
+            "general",
+            "--topic",
+        ],
+    )
+    obj, incomplete = _resolve_incomplete(
+        context,
+        [
+            "--zuliprc",
+            "/tmp/custom.zuliprc",
+            "send",
+            "--stream",
+            "general",
+            "--topic",
+        ],
+        "A",
+    )
+
+    completions = obj.shell_complete(context, incomplete)
+
+    assert [item.value for item in completions] == ["Announcements"]
+    assert seen["zuliprc"] == "/tmp/custom.zuliprc"
 @
