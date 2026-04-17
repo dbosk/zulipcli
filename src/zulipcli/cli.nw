@@ -189,6 +189,7 @@ both name and email fields.
 import argparse
 import copy
 
+import pytest
 from unittest.mock import MagicMock
 
 from zulipcli.cli import (
@@ -530,7 +531,8 @@ def add_topics_command(subparsers):
 @
 
 Resolving the stream name first keeps the CLI ergonomic while still
-using the API endpoint that returns the canonical topic list.
+using the API endpoint that returns the topic list accessible to the
+current user.
 We sort the output alphabetically so repeated invocations remain stable
 and easy to pipe through other tools.
 
@@ -580,6 +582,48 @@ def test_topics_lists_topics_in_sorted_order(capsys):
     client.get_stream_topics.assert_called_once_with(17)
 @
 
+We should also verify that failed topic lookups report the Zulip API
+error on stderr and exit with status [[1]].
+
+<<test functions>>=
+def test_topics_reports_stream_lookup_errors(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "error",
+        "msg": "Invalid channel name 'general'",
+    }
+    args = argparse.Namespace(stream="general")
+
+    with pytest.raises(SystemExit) as excinfo:
+        topics_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid channel name 'general'\n"
+    )
+    client.get_stream_topics.assert_not_called()
+@
+
+<<test functions>>=
+def test_topics_reports_topic_lookup_errors(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "error",
+        "msg": "Invalid channel ID",
+    }
+    args = argparse.Namespace(stream="general")
+
+    with pytest.raises(SystemExit) as excinfo:
+        topics_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == "Error: Invalid channel ID\n"
+@
+
 
 \section{The \texttt{read} subcommand}
 
@@ -624,8 +668,8 @@ The output needs to stay readable for both a whole stream and a single
 topic.
 We therefore print a UTC timestamp, sender, and topic on the first
 line, followed by the raw message content and a blank separator line.
-Using [[apply_markdown=False]] keeps the content as plain text instead
-of rendered HTML, which is better suited for terminal use.
+Using [[apply_markdown=False]] keeps the content as raw Markdown text
+instead of rendered HTML, which is better suited for terminal use.
 
 <<functions>>=
 def _print_read_message(message):
@@ -801,5 +845,26 @@ def test_read_topic_pages_through_history(capsys):
         "First message\n\n"
         "1970-01-01T00:02:00Z\tBob Builder\trelease planning\n"
         "Second message\n\n"
+    )
+@
+
+We should also verify that [[read]] preserves the CLI's existing error
+reporting convention when the history request fails.
+
+<<test functions>>=
+def test_read_reports_history_errors(capsys):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "error",
+        "msg": "Invalid narrow operator",
+    }
+    args = argparse.Namespace(stream="general", topic=None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        read_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid narrow operator\n"
     )
 @
