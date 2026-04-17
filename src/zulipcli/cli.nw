@@ -6,14 +6,18 @@ basic discovery commands.
 When we need to send a direct message with [[zulip-send]], we must
 already know the recipient's email address; there is no built-in way to
 look it up.
-Similarly, there is no command to list the available streams (channels).
+Similarly, there is no command to list the available streams (channels),
+inspect the topics inside a stream, or read a stream's history from the
+terminal.
 
-The [[zulipcli]] command fills these gaps with three subcommands:
+The [[zulipcli]] command fills these gaps with five subcommands:
 \begin{description}
 \item[users] List users, optionally filtered by a name or email
   pattern.
 \item[send] Send a message to a stream or directly to a user.
 \item[streams] List available streams.
+\item[topics] List the topics inside a stream.
+\item[read] Read the history of a stream or one topic within it.
 \end{description}
 
 We use the subcommand pattern familiar from Git and the
@@ -28,11 +32,14 @@ in an [[X_command]] function.
 """Command-line interface for Zulip."""
 
 import argparse
+from datetime import datetime, timezone
 import re
 import sys
 
 import zulipcli
 
+<<read imports>>
+<<constants>>
 <<functions>>
 
 def main():
@@ -70,6 +77,8 @@ section below---the rest of the structure stays untouched.
 add_users_command(subparsers)
 add_send_command(subparsers)
 add_streams_command(subparsers)
+add_topics_command(subparsers)
+add_read_command(subparsers)
 @
 
 After parsing, we create the Zulip client and dispatch to the
@@ -179,11 +188,18 @@ both name and email fields.
 <<test [[cli.py]]>>=
 """Tests for zulipcli.cli."""
 import argparse
-import re
+import copy
 
+import pytest
 from unittest.mock import MagicMock
 
-from zulipcli.cli import users_command
+import zulipcli.cli as cli
+from zulipcli.cli import (
+    HISTORY_BATCH_SIZE,
+    read_command,
+    topics_command,
+    users_command,
+)
 
 <<test functions>>
 @
@@ -491,4 +507,489 @@ def test_streams_filters_by_pattern(capsys):
     assert "random" in lines
     assert "announcements" in lines
     assert "general" not in lines
+@
+
+
+\section{The \texttt{topics} subcommand}
+
+Topics are scoped to a single stream, so the command takes the stream
+name as a required positional argument.
+The Zulip API method [[get_stream_topics()]] expects a numeric stream
+identifier, so we first resolve the human-readable stream name via
+[[get_stream_id()]].
+
+<<functions>>=
+def add_topics_command(subparsers):
+    """Register the topics subcommand."""
+    p = subparsers.add_parser(
+        "topics",
+        help="list topics in a stream"
+    )
+    p.add_argument(
+        "stream",
+        help="stream (channel) name"
+    )
+    p.set_defaults(func=topics_command)
+@
+
+Resolving the stream name first keeps the CLI ergonomic while still
+using the API endpoint that returns the topic list accessible to the
+current user.
+We sort the output alphabetically so repeated invocations remain stable
+and easy to pipe through other tools.
+
+<<functions>>=
+def topics_command(client, args):
+    """List topics in a stream."""
+    result = client.get_stream_id(args.stream)
+    if result["result"] != "success":
+        print(f"Error: {result.get('msg', 'unknown error')}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    result = client.get_stream_topics(result["stream_id"])
+    if result["result"] != "success":
+        print(f"Error: {result.get('msg', 'unknown error')}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    for topic in sorted(result["topics"], key=lambda t: t["name"]):
+        print(topic["name"])
+@
+
+Let's verify that topic listing resolves the stream name and sorts the
+topics.
+
+<<test functions>>=
+def test_topics_lists_topics_in_sorted_order(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "success",
+        "topics": [
+            {"name": "Weekly check-in"},
+            {"name": "Announcements"},
+            {"name": "Lab 1"},
+        ],
+    }
+    args = argparse.Namespace(stream="general")
+    topics_command(client, args)
+    output = capsys.readouterr().out
+    lines = output.strip().split("\n")
+    assert lines == ["Announcements", "Lab 1", "Weekly check-in"]
+    client.get_stream_id.assert_called_once_with("general")
+    client.get_stream_topics.assert_called_once_with(17)
+@
+
+We should also verify that failed topic lookups report the Zulip API
+error on stderr and exit with status [[1]].
+
+<<test functions>>=
+def test_topics_reports_stream_lookup_errors(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "error",
+        "msg": "Invalid channel name 'general'",
+    }
+    args = argparse.Namespace(stream="general")
+
+    with pytest.raises(SystemExit) as excinfo:
+        topics_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid channel name 'general'\n"
+    )
+    client.get_stream_topics.assert_not_called()
+@
+
+<<test functions>>=
+def test_topics_reports_topic_lookup_errors(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "error",
+        "msg": "Invalid channel ID",
+    }
+    args = argparse.Namespace(stream="general")
+
+    with pytest.raises(SystemExit) as excinfo:
+        topics_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == "Error: Invalid channel ID\n"
+@
+
+
+\section{The \texttt{read} subcommand}
+
+The [[read]] command reads the complete history of a stream or one
+topic within a stream.
+Zulip's [[get_messages()]] API already accepts stream and topic names in
+its [[narrow]] parameter, so the command can expose those names
+directly.
+
+To read a whole history rather than one page, we follow Zulip's own
+[[get-history]] example: start at anchor [[0]], which means the oldest
+message in the narrow, and keep advancing the anchor to the message
+immediately after the most recent batch we just printed.
+That yields oldest-to-newest output without collecting the whole history
+in memory first.
+
+<<constants>>=
+HISTORY_BATCH_SIZE = 1000
+@
+
+<<functions>>=
+def add_read_command(subparsers):
+    """Register the read subcommand."""
+    p = subparsers.add_parser(
+        "read",
+        help="read messages from a stream or topic"
+    )
+    p.add_argument(
+        "stream",
+        help="stream (channel) name"
+    )
+    p.add_argument(
+        "topic",
+        nargs="?",
+        default=None,
+        help="topic within the stream"
+    )
+    p.set_defaults(func=read_command)
+@
+
+The output needs to stay readable for both a whole stream and a single
+topic.
+We therefore print a UTC timestamp, sender, and topic on the first
+line.
+For the message body we keep Zulip's raw Markdown when stdout is not a
+TTY, so pipes and redirections receive exactly the source text.
+Interactive terminals can do better: if [[rich]] is installed, we render
+that Markdown locally; otherwise we fall back to the raw text.
+Using [[apply_markdown=False]] keeps both output modes based on the same
+Markdown source instead of rendered HTML.
+
+We keep [[rich]] optional.
+Importing it behind a [[try]]/[[except]] lets the command run unchanged
+without the extra while still enabling richer terminal output for
+[[zulipcli[rich]]].
+
+<<read imports>>=
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+except ImportError:
+    Console = None
+    Markdown = None
+@
+
+Separating terminal detection from body rendering keeps
+[[_print_read_message()]] focused on record formatting.
+It also makes the three cases easy to verify in tests: raw piped output,
+rich rendering on a TTY, and raw fallback when [[rich]] is absent.
+
+<<functions>>=
+def _stdout_is_tty():
+    """Return whether stdout is an interactive terminal."""
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(isatty and isatty())
+@
+
+<<functions>>=
+def _print_read_content(content):
+    """Print Markdown content for the current stdout."""
+    if _stdout_is_tty() and Console is not None and Markdown is not None:
+        Console(file=sys.stdout).print(Markdown(content))
+    else:
+        print(content)
+
+<<functions>>=
+def _print_read_message(message):
+    """Print one message in the read command format."""
+    timestamp = datetime.fromtimestamp(
+        message["timestamp"],
+        timezone.utc,
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    topic = message.get("topic") or message.get("subject", "")
+    print(f"{timestamp}\t{message['sender_full_name']}\t{topic}")
+    _print_read_content(message["content"])
+    print()
+@
+
+The request stays constant across pages except for the anchor.
+Each successful batch is printed immediately, and then the anchor moves
+to one past the last message ID we have already seen.
+
+<<functions>>=
+def read_command(client, args):
+    """Read messages from a stream or topic."""
+    request = {
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [{"operator": "stream", "operand": args.stream}],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }
+    if args.topic:
+        request["narrow"].append(
+            {"operator": "topic", "operand": args.topic}
+        )
+
+    found_newest = False
+    while not found_newest:
+        result = client.get_messages(request)
+        if result["result"] != "success":
+            print(f"Error: {result.get('msg', 'unknown error')}",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        found_newest = result["found_newest"]
+        if result["messages"]:
+            for message in result["messages"]:
+                _print_read_message(message)
+            request["anchor"] = result["messages"][-1]["id"] + 1
+@
+
+Let's build a small helper for synthetic history payloads.
+
+<<test functions>>=
+def _make_stream_message(message_id, timestamp, sender, topic, content):
+    """Create a sample stream message for testing."""
+    return {
+        "id": message_id,
+        "timestamp": timestamp,
+        "sender_full_name": sender,
+        "topic": topic,
+        "content": content,
+    }
+@
+
+Let's verify that reading a whole stream narrows on the stream name and
+formats each message as planned.
+
+<<test functions>>=
+def test_read_stream_uses_stream_name(capsys, monkeypatch):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                1,
+                0,
+                "Alice Admin",
+                "Announcements",
+                "Hello stream",
+            ),
+        ],
+    }
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return response
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+    read_command(client, args)
+
+    assert requests == [{
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [
+            {"operator": "stream", "operand": "general"},
+        ],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }]
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
+        "Hello stream\n\n"
+    )
+@
+
+We should also verify that interactive terminals render Markdown when
+the optional [[rich]] dependency is available.
+
+<<test functions>>=
+def test_read_renders_markdown_on_tty(capsys, monkeypatch):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                1,
+                0,
+                "Alice Admin",
+                "Announcements",
+                "*Hello stream*",
+            ),
+        ],
+    }
+
+    class FakeMarkdown:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeConsole:
+        def __init__(self, *, file):
+            self.file = file
+
+        def print(self, markdown):
+            print(f"rendered: {markdown.text}", file=self.file)
+
+    client = MagicMock()
+    client.get_messages.return_value = response
+    args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", FakeConsole)
+    monkeypatch.setattr(cli, "Markdown", FakeMarkdown)
+    read_command(client, args)
+
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
+        "rendered: *Hello stream*\n\n"
+    )
+@
+
+TTYs without [[rich]] should still keep working.
+In that case we fall back to the same raw Markdown that we use for
+non-interactive output.
+
+<<test functions>>=
+def test_read_tty_falls_back_to_raw_markdown_without_rich(
+    capsys,
+    monkeypatch,
+):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                1,
+                0,
+                "Alice Admin",
+                "Announcements",
+                "*Hello stream*",
+            ),
+        ],
+    }
+
+    client = MagicMock()
+    client.get_messages.return_value = response
+    args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", None)
+    monkeypatch.setattr(cli, "Markdown", None)
+    read_command(client, args)
+
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
+        "*Hello stream*\n\n"
+    )
+@
+
+We can also verify that topic reads keep both names in the narrow and
+advance the anchor when the history spans more than one API page.
+
+<<test functions>>=
+def test_read_topic_pages_through_history(capsys, monkeypatch):
+    responses = [
+        {
+            "result": "success",
+            "found_newest": False,
+            "messages": [
+                _make_stream_message(
+                    3,
+                    60,
+                    "Alice Admin",
+                    "release planning",
+                    "First message",
+                ),
+            ],
+        },
+        {
+            "result": "success",
+            "found_newest": True,
+            "messages": [
+                _make_stream_message(
+                    4,
+                    120,
+                    "Bob Builder",
+                    "release planning",
+                    "Second message",
+                ),
+            ],
+        },
+    ]
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return responses[len(requests) - 1]
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    args = argparse.Namespace(
+        stream="general",
+        topic="release planning",
+    )
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+    read_command(client, args)
+
+    assert requests[0] == {
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [
+            {"operator": "stream", "operand": "general"},
+            {"operator": "topic", "operand": "release planning"},
+        ],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }
+    assert requests[1]["anchor"] == 4
+    assert requests[1]["narrow"] == requests[0]["narrow"]
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:01:00Z\tAlice Admin\trelease planning\n"
+        "First message\n\n"
+        "1970-01-01T00:02:00Z\tBob Builder\trelease planning\n"
+        "Second message\n\n"
+    )
+@
+
+We should also verify that [[read]] preserves the CLI's existing error
+reporting convention when the history request fails.
+
+<<test functions>>=
+def test_read_reports_history_errors(capsys):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "error",
+        "msg": "Invalid narrow operator",
+    }
+    args = argparse.Namespace(stream="general", topic=None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        read_command(client, args)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid narrow operator\n"
+    )
 @

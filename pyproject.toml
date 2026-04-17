@@ -1,6 +1,6 @@
 [project]
 name = "zulipcli"
-version = "0.1"
+version = "0.2"
 description = "Command-line interface for Zulip"
 authors = [
   {name = "Daniel Bosk", email = "daniel@bosk.se"}
@@ -10,6 +10,11 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "zulip"
+]
+
+[project.optional-dependencies]
+rich = [
+  "rich"
 ]
 
 [project.scripts]
