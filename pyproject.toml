@@ -12,6 +12,11 @@ dependencies = [
   "zulip"
 ]
 
+[project.optional-dependencies]
+rich = [
+  "rich"
+]
+
 [project.scripts]
 zulipcli = "zulipcli.cli:main"
 

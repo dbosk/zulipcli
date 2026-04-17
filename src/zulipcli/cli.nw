@@ -38,6 +38,7 @@ import sys
 
 import zulipcli
 
+<<read imports>>
 <<constants>>
 <<functions>>
 
@@ -192,6 +193,7 @@ import copy
 import pytest
 from unittest.mock import MagicMock
 
+import zulipcli.cli as cli
 from zulipcli.cli import (
     HISTORY_BATCH_SIZE,
     read_command,
@@ -667,9 +669,47 @@ def add_read_command(subparsers):
 The output needs to stay readable for both a whole stream and a single
 topic.
 We therefore print a UTC timestamp, sender, and topic on the first
-line, followed by the raw message content and a blank separator line.
-Using [[apply_markdown=False]] keeps the content as raw Markdown text
-instead of rendered HTML, which is better suited for terminal use.
+line.
+For the message body we keep Zulip's raw Markdown when stdout is not a
+TTY, so pipes and redirections receive exactly the source text.
+Interactive terminals can do better: if [[rich]] is installed, we render
+that Markdown locally; otherwise we fall back to the raw text.
+Using [[apply_markdown=False]] keeps both output modes based on the same
+Markdown source instead of rendered HTML.
+
+We keep [[rich]] optional.
+Importing it behind a [[try]]/[[except]] lets the command run unchanged
+without the extra while still enabling richer terminal output for
+[[zulipcli[rich]]].
+
+<<read imports>>=
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+except ImportError:
+    Console = None
+    Markdown = None
+@
+
+Separating terminal detection from body rendering keeps
+[[_print_read_message()]] focused on record formatting.
+It also makes the three cases easy to verify in tests: raw piped output,
+rich rendering on a TTY, and raw fallback when [[rich]] is absent.
+
+<<functions>>=
+def _stdout_is_tty():
+    """Return whether stdout is an interactive terminal."""
+    isatty = getattr(sys.stdout, "isatty", None)
+    return bool(isatty and isatty())
+@
+
+<<functions>>=
+def _print_read_content(content):
+    """Print Markdown content for the current stdout."""
+    if _stdout_is_tty() and Console is not None and Markdown is not None:
+        Console(file=sys.stdout).print(Markdown(content))
+    else:
+        print(content)
 
 <<functions>>=
 def _print_read_message(message):
@@ -680,7 +720,7 @@ def _print_read_message(message):
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
     topic = message.get("topic") or message.get("subject", "")
     print(f"{timestamp}\t{message['sender_full_name']}\t{topic}")
-    print(message["content"])
+    _print_read_content(message["content"])
     print()
 @
 
@@ -737,7 +777,7 @@ Let's verify that reading a whole stream narrows on the stream name and
 formats each message as planned.
 
 <<test functions>>=
-def test_read_stream_uses_stream_name(capsys):
+def test_read_stream_uses_stream_name(capsys, monkeypatch):
     response = {
         "result": "success",
         "found_newest": True,
@@ -760,6 +800,7 @@ def test_read_stream_uses_stream_name(capsys):
     client = MagicMock()
     client.get_messages.side_effect = get_messages
     args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
     read_command(client, args)
 
     assert requests == [{
@@ -779,11 +820,94 @@ def test_read_stream_uses_stream_name(capsys):
     )
 @
 
+We should also verify that interactive terminals render Markdown when
+the optional [[rich]] dependency is available.
+
+<<test functions>>=
+def test_read_renders_markdown_on_tty(capsys, monkeypatch):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                1,
+                0,
+                "Alice Admin",
+                "Announcements",
+                "*Hello stream*",
+            ),
+        ],
+    }
+
+    class FakeMarkdown:
+        def __init__(self, text):
+            self.text = text
+
+    class FakeConsole:
+        def __init__(self, *, file):
+            self.file = file
+
+        def print(self, markdown):
+            print(f"rendered: {markdown.text}", file=self.file)
+
+    client = MagicMock()
+    client.get_messages.return_value = response
+    args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", FakeConsole)
+    monkeypatch.setattr(cli, "Markdown", FakeMarkdown)
+    read_command(client, args)
+
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
+        "rendered: *Hello stream*\n\n"
+    )
+@
+
+TTYs without [[rich]] should still keep working.
+In that case we fall back to the same raw Markdown that we use for
+non-interactive output.
+
+<<test functions>>=
+def test_read_tty_falls_back_to_raw_markdown_without_rich(
+    capsys,
+    monkeypatch,
+):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                1,
+                0,
+                "Alice Admin",
+                "Announcements",
+                "*Hello stream*",
+            ),
+        ],
+    }
+
+    client = MagicMock()
+    client.get_messages.return_value = response
+    args = argparse.Namespace(stream="general", topic=None)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", None)
+    monkeypatch.setattr(cli, "Markdown", None)
+    read_command(client, args)
+
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
+        "*Hello stream*\n\n"
+    )
+@
+
 We can also verify that topic reads keep both names in the narrow and
 advance the anchor when the history spans more than one API page.
 
 <<test functions>>=
-def test_read_topic_pages_through_history(capsys):
+def test_read_topic_pages_through_history(capsys, monkeypatch):
     responses = [
         {
             "result": "success",
@@ -824,6 +948,7 @@ def test_read_topic_pages_through_history(capsys):
         stream="general",
         topic="release planning",
     )
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
     read_command(client, args)
 
     assert requests[0] == {
