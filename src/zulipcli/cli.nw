@@ -20,10 +20,11 @@ The [[zulipcli]] command fills these gaps with five subcommands:
 \item[read] Read the history of a stream or one topic within it.
 \end{description}
 
-We use the subcommand pattern familiar from Git and the
-[[canvaslms]] tool: each subcommand registers itself on an argparse
-subparser via an [[add_X_command]] function, and implements its logic
-in an [[X_command]] function.
+We keep the subcommand pattern familiar from Git and the
+[[canvaslms]] tool, but implement it with [[Typer]] instead of
+[[argparse]]. Typer still lets each subcommand read like an ordinary
+Python function, while adding shell completion for command names,
+option names, and argument values.
 
 
 \section{Program structure}
@@ -31,68 +32,353 @@ in an [[X_command]] function.
 <<[[cli.py]]>>=
 """Command-line interface for Zulip."""
 
-import argparse
 from datetime import datetime, timezone
+from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
+from typing import Annotated, Optional
+
+from rich.console import Console
+from rich.markdown import Markdown
+import typer
 
 import zulipcli
 
-<<read imports>>
 <<constants>>
 <<functions>>
 
 def main():
     """Entry point for the zulipcli command."""
-    <<set up argument parser>>
-    <<parse arguments and dispatch>>
+    app()
 @
 
 
 \section{Argument parsing}
 
-The top-level parser accepts a \texttt{-{}-zuliprc} option to override the
-default configuration file path.
-Each subcommand then adds its own flags and positional arguments.
+The top-level Typer application accepts a \texttt{-{}-zuliprc} option to
+override the default configuration file path.
+The callback stores that override in the root context, so each
+subcommand can ask one helper for a configured client.
+Typing the option as a [[Path]] also gives us filesystem completion for
+free.
 
-<<set up argument parser>>=
-parser = argparse.ArgumentParser(
-    prog="zulipcli",
-    description="Command-line interface for Zulip"
+<<functions>>=
+app = typer.Typer(
+    help="Command-line interface for Zulip",
+    add_completion=True,
+    no_args_is_help=True,
 )
-parser.add_argument(
-    "--zuliprc",
-    default=None,
-    help="path to zuliprc config file (default: ~/.zuliprc)"
-)
-subparsers = parser.add_subparsers(dest="command")
-<<register subcommands>>
 @
 
-We register all subcommands here.
-Adding a new subcommand later means adding one line here and one
-section below---the rest of the structure stays untouched.
-
-<<register subcommands>>=
-add_users_command(subparsers)
-add_send_command(subparsers)
-add_streams_command(subparsers)
-add_topics_command(subparsers)
-add_read_command(subparsers)
+<<functions>>=
+@app.callback()
+def configure_app(
+    ctx: typer.Context,
+    zuliprc: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="path to zuliprc config file (default: ~/.zuliprc)",
+            dir_okay=False,
+        ),
+    ] = None,
+):
+    """Configure shared CLI options."""
+    ctx.obj = {
+        "zuliprc": None if zuliprc is None else str(zuliprc),
+    }
 @
 
-After parsing, we create the Zulip client and dispatch to the
-subcommand's handler function.
-If no subcommand was given, we print the help text---this is more
-useful than a cryptic error about a missing attribute.
+<<functions>>=
+def _get_client_from_context(ctx):
+    """Create a Zulip client from the current Typer context."""
+    root_ctx = ctx.find_root()
+    obj = root_ctx.obj or {}
+    return zulipcli.get_client(obj.get("zuliprc"))
+@
 
-<<parse arguments and dispatch>>=
-args = parser.parse_args()
-if not hasattr(args, "func") or args.func is None:
-    parser.print_help()
-    sys.exit(1)
-client = zulipcli.get_client(args.zuliprc)
-args.func(client, args)
+
+\section{Reporting Zulip API errors}
+
+The ordinary commands should all report Zulip API failures in the same
+way: print the server's message on stderr and exit with status [[1]].
+Factoring that policy into two helpers keeps each command focused on its
+own data handling instead of repeating the same error-checking branch.
+
+The completion callbacks are the exception. They must stay silent, so
+they continue to inspect the raw Zulip result directly and return an
+empty candidate list on failure.
+
+<<functions>>=
+def _exit_with_error(message):
+    """Print an error message and exit with status 1."""
+    print(f"Error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+@
+
+<<functions>>=
+def _require_success(result):
+    """Return a successful Zulip API result or exit with its error."""
+    if result.get("result") != "success":
+        _exit_with_error(result.get("msg", "unknown Zulip API error"))
+    return result
+@
+
+
+\section{Completion lookups}
+
+Typer already handles command-name and option-name completion.
+The remaining work is value completion for live Zulip data.
+These callbacks must stay silent on errors because shells treat stdout
+as completion output.
+If the client cannot be created or a Zulip API request fails, we simply
+return no candidates.
+
+The raw command-line arguments are also available during completion.
+That lets us recover the top-level [[--zuliprc]] override and even the
+selected stream for [[send --topic]], where the user might supply
+[[--stream]] before or after [[--topic]].
+
+<<functions>>=
+def _get_zuliprc_from_args(args: list[str]):
+    """Extract the zuliprc override from raw completion arguments."""
+    for index, arg in enumerate(args):
+        if arg == "--zuliprc":
+            if index + 1 < len(args):
+                return args[index + 1]
+            return None
+        if arg.startswith("--zuliprc="):
+            return arg.split("=", 1)[1]
+    return None
+@
+
+<<functions>>=
+def _get_stream_from_args(ctx: typer.Context, args: list[str]):
+    """Return the selected stream from parsed params or raw args."""
+    stream = ctx.params.get("stream")
+    if stream:
+        return stream
+
+    for index, arg in enumerate(args):
+        if arg in {"--stream", "-s"}:
+            if index + 1 < len(args):
+                return args[index + 1]
+            return None
+        if arg.startswith("--stream="):
+            return arg.split("=", 1)[1]
+    return None
+@
+
+<<functions>>=
+def _get_completion_client(args: list[str]):
+    """Create a Zulip client for shell completion lookups."""
+    try:
+        return zulipcli.get_client(_get_zuliprc_from_args(args))
+    except Exception:
+        return None
+@
+
+<<functions>>=
+def _matches_completion(candidate: str, incomplete: str):
+    """Return whether candidate matches the current shell fragment."""
+    if not incomplete:
+        return True
+    return candidate.casefold().startswith(incomplete.casefold())
+@
+
+<<functions>>=
+def complete_stream_names(args: list[str], incomplete: str):
+    """Autocomplete stream names."""
+    client = _get_completion_client(args)
+    if client is None:
+        return []
+
+    result = client.get_streams()
+    if result.get("result") != "success":
+        return []
+
+    return [
+        stream["name"]
+        for stream in sorted(
+            result["streams"],
+            key=lambda stream: stream["name"].casefold(),
+        )
+        if _matches_completion(stream["name"], incomplete)
+    ]
+@
+
+Topics depend on the selected stream, so their completion callback first
+resolves that stream name and then asks Zulip for the available topics.
+That same callback serves both [[read STREAM TOPIC]] and
+[[send --stream STREAM --topic TOPIC]].
+
+<<functions>>=
+def complete_topic_names(
+    ctx: typer.Context,
+    args: list[str],
+    incomplete: str,
+):
+    """Autocomplete topic names for the selected stream."""
+    stream = _get_stream_from_args(ctx, args)
+    if not stream:
+        return []
+
+    client = _get_completion_client(args)
+    if client is None:
+        return []
+
+    result = client.get_stream_id(stream)
+    if result.get("result") != "success":
+        return []
+
+    result = client.get_stream_topics(result["stream_id"])
+    if result.get("result") != "success":
+        return []
+
+    return [
+        topic["name"]
+        for topic in sorted(
+            result["topics"],
+            key=lambda topic: topic["name"].casefold(),
+        )
+        if _matches_completion(topic["name"], incomplete)
+    ]
+@
+
+Direct-message completion should return the email address that Zulip
+expects, but humans recognise colleagues by name more easily than by
+address.
+We therefore return the email as the value and the full name as the help
+text for shells that can display it.
+
+<<functions>>=
+def complete_user_emails(args: list[str], incomplete: str):
+    """Autocomplete direct-message recipients."""
+    client = _get_completion_client(args)
+    if client is None:
+        return []
+
+    result = client.get_members()
+    if result.get("result") != "success":
+        return []
+
+    completions = []
+    for member in sorted(
+        result["members"],
+        key=lambda member: member["full_name"].casefold(),
+    ):
+        if not member.get("is_active", True):
+            continue
+
+        email = member["email"]
+        full_name = member["full_name"]
+        if not (
+            _matches_completion(email, incomplete)
+            or _matches_completion(full_name, incomplete)
+        ):
+            continue
+        completions.append((email, full_name))
+    return completions
+@
+
+Let's verify that the Typer application still shows help when invoked
+without a subcommand and that the shared [[--zuliprc]] option reaches
+both commands and completion callbacks.
+
+<<test [[cli.py]]>>=
+"""Tests for zulipcli.cli."""
+
+import copy
+import io
+from types import SimpleNamespace
+
+import pytest
+from typer.testing import CliRunner
+from unittest.mock import MagicMock
+
+import zulipcli.cli as cli
+from zulipcli.cli import (
+    HISTORY_BATCH_SIZE,
+    app,
+    complete_stream_names,
+    complete_topic_names,
+    complete_user_emails,
+    read_command,
+    send_command,
+    streams_command,
+    topics_command,
+    users_command,
+)
+
+runner = CliRunner()
+
+<<test functions>>
+@
+
+<<test functions>>=
+def test_cli_shows_help_without_command():
+    result = runner.invoke(app, [])
+    assert result.exit_code == 0
+    assert "Commands" in result.output
+    assert "read" in result.output
+@
+
+<<test functions>>=
+def test_cli_passes_zuliprc_to_commands(monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [],
+    }
+    seen = {}
+
+    def get_client(zuliprc=None):
+        seen["zuliprc"] = zuliprc
+        return client
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+    result = runner.invoke(
+        app,
+        ["--zuliprc", "/tmp/custom.zuliprc", "streams"],
+    )
+    assert result.exit_code == 0
+    assert seen["zuliprc"] == "/tmp/custom.zuliprc"
+@
+
+<<test functions>>=
+def test_stream_completion_uses_zuliprc_override(monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [{"name": "general"}],
+    }
+    seen = {}
+
+    def get_client(zuliprc=None):
+        seen["zuliprc"] = zuliprc
+        return client
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+    assert complete_stream_names(
+        ["--zuliprc", "/tmp/custom.zuliprc", "read", "g"],
+        "g",
+    ) == ["general"]
+    assert seen["zuliprc"] == "/tmp/custom.zuliprc"
+@
+
+<<test functions>>=
+def test_stream_completion_silently_ignores_lookup_errors(monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "error",
+        "msg": "not allowed",
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+    assert complete_stream_names(["streams", "g"], "g") == []
 @
 
 
@@ -111,31 +397,31 @@ By default we exclude bots and deactivated users, since the common use
 case is finding a human colleague's email address.
 
 <<functions>>=
-def add_users_command(subparsers):
-    """Register the users subcommand."""
-    p = subparsers.add_parser(
-        "users",
-        help="list users on the Zulip server"
+@app.command("users")
+def users(
+    ctx: typer.Context,
+    pattern: Annotated[
+        Optional[str],
+        typer.Argument(help="filter users by name or email (regex)"),
+    ] = None,
+    include_bots: Annotated[
+        bool,
+        typer.Option(help="include bot accounts in output"),
+    ] = False,
+    include_deactivated: Annotated[
+        bool,
+        typer.Option(help="include deactivated accounts in output"),
+    ] = False,
+):
+    """List users on the Zulip server."""
+    users_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            pattern=pattern,
+            include_bots=include_bots,
+            include_deactivated=include_deactivated,
+        ),
     )
-    p.add_argument(
-        "pattern",
-        nargs="?",
-        default=None,
-        help="filter users by name or email (regex)"
-    )
-    p.add_argument(
-        "--include-bots",
-        action="store_true",
-        default=False,
-        help="include bot accounts in output"
-    )
-    p.add_argument(
-        "--include-deactivated",
-        action="store_true",
-        default=False,
-        help="include deactivated accounts in output"
-    )
-    p.set_defaults(func=users_command)
 @
 
 The implementation fetches all members, applies the filters, and prints
@@ -148,11 +434,7 @@ against both the full name and the email address, so that
 <<functions>>=
 def users_command(client, args):
     """List users, optionally filtered by pattern."""
-    result = client.get_members()
-    if result["result"] != "success":
-        print(f"Error: {result.get('msg', 'unknown error')}",
-              file=sys.stderr)
-        sys.exit(1)
+    result = _require_success(client.get_members())
 
     if args.pattern:
         pattern = re.compile(args.pattern, re.IGNORECASE)
@@ -184,25 +466,6 @@ Let's verify that the filtering logic works correctly.
 We create mock API responses and check that bots and deactivated users
 are excluded by default, and that the pattern filter matches against
 both name and email fields.
-
-<<test [[cli.py]]>>=
-"""Tests for zulipcli.cli."""
-import argparse
-import copy
-
-import pytest
-from unittest.mock import MagicMock
-
-import zulipcli.cli as cli
-from zulipcli.cli import (
-    HISTORY_BATCH_SIZE,
-    read_command,
-    topics_command,
-    users_command,
-)
-
-<<test functions>>
-@
 
 <<test functions>>=
 def _make_members():
@@ -242,7 +505,7 @@ def _make_members():
 def test_users_excludes_bots_by_default(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         pattern=None,
         include_bots=False,
         include_deactivated=False,
@@ -257,7 +520,7 @@ def test_users_excludes_bots_by_default(capsys):
 def test_users_excludes_deactivated_by_default(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         pattern=None,
         include_bots=False,
         include_deactivated=False,
@@ -272,7 +535,7 @@ def test_users_excludes_deactivated_by_default(capsys):
 def test_users_pattern_filters_by_name(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         pattern="diana",
         include_bots=False,
         include_deactivated=False,
@@ -287,7 +550,7 @@ def test_users_pattern_filters_by_name(capsys):
 def test_users_pattern_filters_by_email(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         pattern="alice@",
         include_bots=False,
         include_deactivated=False,
@@ -302,7 +565,7 @@ def test_users_pattern_filters_by_email(capsys):
 def test_users_include_bots(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         pattern=None,
         include_bots=True,
         include_deactivated=False,
@@ -325,34 +588,49 @@ Reading from stdin is useful for piping output from other commands
 directly into a Zulip message, which is a common scripting pattern.
 
 <<functions>>=
-def add_send_command(subparsers):
-    """Register the send subcommand."""
-    p = subparsers.add_parser(
-        "send",
-        help="send a message"
+@app.command("send")
+def send(
+    ctx: typer.Context,
+    stream: Annotated[
+        Optional[str],
+        typer.Option(
+            "--stream",
+            "-s",
+            help="destination stream (channel) name",
+            autocompletion=complete_stream_names,
+        ),
+    ] = None,
+    topic: Annotated[
+        Optional[str],
+        typer.Option(
+            "--topic",
+            "-t",
+            help="topic within the stream",
+            autocompletion=complete_topic_names,
+        ),
+    ] = None,
+    to: Annotated[
+        Optional[str],
+        typer.Option(
+            help="recipient email for direct messages",
+            autocompletion=complete_user_emails,
+        ),
+    ] = None,
+    message: Annotated[
+        Optional[str],
+        typer.Argument(help="message content (reads stdin if omitted)"),
+    ] = None,
+):
+    """Send a message."""
+    send_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            stream=stream,
+            topic=topic,
+            to=to,
+            message=message,
+        ),
     )
-    p.add_argument(
-        "--stream", "-s",
-        default=None,
-        help="destination stream (channel) name"
-    )
-    p.add_argument(
-        "--topic", "-t",
-        default=None,
-        help="topic within the stream"
-    )
-    p.add_argument(
-        "--to",
-        default=None,
-        help="recipient email for direct messages"
-    )
-    p.add_argument(
-        "message",
-        nargs="?",
-        default=None,
-        help="message content (reads stdin if omitted)"
-    )
-    p.set_defaults(func=send_command)
 @
 
 The Zulip API distinguishes between [[stream]] messages (sent to a
@@ -368,14 +646,15 @@ def send_command(client, args):
     if content is None:
         content = sys.stdin.read()
 
+    if args.stream and args.to:
+        _exit_with_error("specify either --stream/--topic or --to")
+
     if args.stream:
         <<send stream message>>
     elif args.to:
         <<send direct message>>
     else:
-        print("Error: specify --stream/--topic or --to",
-              file=sys.stderr)
-        sys.exit(1)
+        _exit_with_error("specify --stream/--topic or --to")
 @
 
 For stream messages, a topic is required---Zulip enforces this on the
@@ -383,20 +662,14 @@ server side, but we catch it early to give a clearer error message.
 
 <<send stream message>>=
 if not args.topic:
-    print("Error: --topic is required with --stream",
-          file=sys.stderr)
-    sys.exit(1)
+    _exit_with_error("--topic is required with --stream")
 request = {
     "type": "stream",
     "to": args.stream,
     "topic": args.topic,
     "content": content,
 }
-result = client.send_message(request)
-if result["result"] != "success":
-    print(f"Error: {result.get('msg', 'unknown error')}",
-          file=sys.stderr)
-    sys.exit(1)
+_require_success(client.send_message(request))
 @
 
 Direct messages use the [[direct]] type (called [[private]] in older
@@ -410,11 +683,131 @@ request = {
     "to": [args.to],
     "content": content,
 }
-result = client.send_message(request)
-if result["result"] != "success":
-    print(f"Error: {result.get('msg', 'unknown error')}",
-          file=sys.stderr)
-    sys.exit(1)
+_require_success(client.send_message(request))
+@
+
+Let's verify the error cases that the Typer wrappers still delegate to:
+rejecting ambiguous mode selection, requiring a topic for stream
+messages, reading the message body from stdin, and sending the expected
+request payload.
+
+<<test functions>>=
+def test_send_reads_message_from_stdin(monkeypatch):
+    client = MagicMock()
+    client.send_message.return_value = {"result": "success"}
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("Hello stream"))
+    send_command(
+        client,
+        SimpleNamespace(
+            stream="general",
+            topic="Announcements",
+            to=None,
+            message=None,
+        ),
+    )
+    client.send_message.assert_called_once_with({
+        "type": "stream",
+        "to": "general",
+        "topic": "Announcements",
+        "content": "Hello stream",
+    })
+@
+
+<<test functions>>=
+def test_send_rejects_mixed_stream_and_direct_targets(capsys):
+    client = MagicMock()
+
+    with pytest.raises(SystemExit) as excinfo:
+        send_command(
+            client,
+            SimpleNamespace(
+                stream="general",
+                topic="Announcements",
+                to="alice@example.com",
+                message="Hello",
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: specify either --stream/--topic or --to\n"
+    )
+    client.send_message.assert_not_called()
+@
+
+<<test functions>>=
+def test_send_requires_topic_for_stream_messages(capsys):
+    client = MagicMock()
+
+    with pytest.raises(SystemExit) as excinfo:
+        send_command(
+            client,
+            SimpleNamespace(
+                stream="general",
+                topic=None,
+                to=None,
+                message="Hello",
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: --topic is required with --stream\n"
+    )
+    client.send_message.assert_not_called()
+@
+
+<<test functions>>=
+def test_send_direct_message_uses_email_list():
+    client = MagicMock()
+    client.send_message.return_value = {"result": "success"}
+
+    send_command(
+        client,
+        SimpleNamespace(
+            stream=None,
+            topic=None,
+            to="alice@example.com",
+            message="Hello directly",
+        ),
+    )
+
+    client.send_message.assert_called_once_with({
+        "type": "direct",
+        "to": ["alice@example.com"],
+        "content": "Hello directly",
+    })
+@
+
+<<test functions>>=
+def test_send_cli_uses_stream_completion_and_dispatch(monkeypatch):
+    client = MagicMock()
+    client.send_message.return_value = {"result": "success"}
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: client,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "send",
+            "--stream",
+            "general",
+            "--topic",
+            "Announcements",
+            "Hello",
+        ],
+    )
+
+    assert result.exit_code == 0
+    client.send_message.assert_called_once_with({
+        "type": "stream",
+        "to": "general",
+        "topic": "Announcements",
+        "content": "Hello",
+    })
 @
 
 
@@ -426,19 +819,19 @@ on a server with many streams where the web interface's sidebar
 becomes unwieldy.
 
 <<functions>>=
-def add_streams_command(subparsers):
-    """Register the streams subcommand."""
-    p = subparsers.add_parser(
-        "streams",
-        help="list available streams (channels)"
+@app.command("streams")
+def streams(
+    ctx: typer.Context,
+    pattern: Annotated[
+        Optional[str],
+        typer.Argument(help="filter streams by name (regex)"),
+    ] = None,
+):
+    """List available streams."""
+    streams_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(pattern=pattern),
     )
-    p.add_argument(
-        "pattern",
-        nargs="?",
-        default=None,
-        help="filter streams by name (regex)"
-    )
-    p.set_defaults(func=streams_command)
 @
 
 Like the [[users]] command, we support an optional regex pattern for
@@ -447,11 +840,7 @@ filtering and sort the output alphabetically for readability.
 <<functions>>=
 def streams_command(client, args):
     """List available streams."""
-    result = client.get_streams()
-    if result["result"] != "success":
-        print(f"Error: {result.get('msg', 'unknown error')}",
-              file=sys.stderr)
-        sys.exit(1)
+    result = _require_success(client.get_streams())
 
     if args.pattern:
         pattern = re.compile(args.pattern, re.IGNORECASE)
@@ -469,8 +858,6 @@ Let's verify the streams command filters correctly.
 
 <<test functions>>=
 def test_streams_lists_all(capsys):
-    from zulipcli.cli import streams_command
-
     client = MagicMock()
     client.get_streams.return_value = {
         "result": "success",
@@ -480,7 +867,7 @@ def test_streams_lists_all(capsys):
             {"name": "announcements"},
         ],
     }
-    args = argparse.Namespace(pattern=None)
+    args = SimpleNamespace(pattern=None)
     streams_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
@@ -489,8 +876,6 @@ def test_streams_lists_all(capsys):
 
 <<test functions>>=
 def test_streams_filters_by_pattern(capsys):
-    from zulipcli.cli import streams_command
-
     client = MagicMock()
     client.get_streams.return_value = {
         "result": "success",
@@ -500,7 +885,7 @@ def test_streams_filters_by_pattern(capsys):
             {"name": "announcements"},
         ],
     }
-    args = argparse.Namespace(pattern="an")
+    args = SimpleNamespace(pattern="an")
     streams_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
@@ -519,17 +904,22 @@ identifier, so we first resolve the human-readable stream name via
 [[get_stream_id()]].
 
 <<functions>>=
-def add_topics_command(subparsers):
-    """Register the topics subcommand."""
-    p = subparsers.add_parser(
-        "topics",
-        help="list topics in a stream"
+@app.command("topics")
+def topics(
+    ctx: typer.Context,
+    stream: Annotated[
+        str,
+        typer.Argument(
+            help="stream (channel) name",
+            autocompletion=complete_stream_names,
+        ),
+    ],
+):
+    """List topics in a stream."""
+    topics_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(stream=stream),
     )
-    p.add_argument(
-        "stream",
-        help="stream (channel) name"
-    )
-    p.set_defaults(func=topics_command)
 @
 
 Resolving the stream name first keeps the CLI ergonomic while still
@@ -541,17 +931,9 @@ and easy to pipe through other tools.
 <<functions>>=
 def topics_command(client, args):
     """List topics in a stream."""
-    result = client.get_stream_id(args.stream)
-    if result["result"] != "success":
-        print(f"Error: {result.get('msg', 'unknown error')}",
-              file=sys.stderr)
-        sys.exit(1)
+    result = _require_success(client.get_stream_id(args.stream))
 
-    result = client.get_stream_topics(result["stream_id"])
-    if result["result"] != "success":
-        print(f"Error: {result.get('msg', 'unknown error')}",
-              file=sys.stderr)
-        sys.exit(1)
+    result = _require_success(client.get_stream_topics(result["stream_id"]))
 
     for topic in sorted(result["topics"], key=lambda t: t["name"]):
         print(topic["name"])
@@ -575,7 +957,7 @@ def test_topics_lists_topics_in_sorted_order(capsys):
             {"name": "Lab 1"},
         ],
     }
-    args = argparse.Namespace(stream="general")
+    args = SimpleNamespace(stream="general")
     topics_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
@@ -594,7 +976,7 @@ def test_topics_reports_stream_lookup_errors(capsys):
         "result": "error",
         "msg": "Invalid channel name 'general'",
     }
-    args = argparse.Namespace(stream="general")
+    args = SimpleNamespace(stream="general")
 
     with pytest.raises(SystemExit) as excinfo:
         topics_command(client, args)
@@ -617,7 +999,7 @@ def test_topics_reports_topic_lookup_errors(capsys):
         "result": "error",
         "msg": "Invalid channel ID",
     }
-    args = argparse.Namespace(stream="general")
+    args = SimpleNamespace(stream="general")
 
     with pytest.raises(SystemExit) as excinfo:
         topics_command(client, args)
@@ -647,23 +1029,29 @@ HISTORY_BATCH_SIZE = 1000
 @
 
 <<functions>>=
-def add_read_command(subparsers):
-    """Register the read subcommand."""
-    p = subparsers.add_parser(
-        "read",
-        help="read messages from a stream or topic"
+@app.command("read")
+def read(
+    ctx: typer.Context,
+    stream: Annotated[
+        str,
+        typer.Argument(
+            help="stream (channel) name",
+            autocompletion=complete_stream_names,
+        ),
+    ],
+    topic: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="topic within the stream",
+            autocompletion=complete_topic_names,
+        ),
+    ] = None,
+):
+    """Read messages from a stream or topic."""
+    read_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(stream=stream, topic=topic),
     )
-    p.add_argument(
-        "stream",
-        help="stream (channel) name"
-    )
-    p.add_argument(
-        "topic",
-        nargs="?",
-        default=None,
-        help="topic within the stream"
-    )
-    p.set_defaults(func=read_command)
 @
 
 The output needs to stay readable for both a whole stream and a single
@@ -672,29 +1060,15 @@ We therefore print a UTC timestamp, sender, and topic on the first
 line.
 For the message body we keep Zulip's raw Markdown when stdout is not a
 TTY, so pipes and redirections receive exactly the source text.
-Interactive terminals can do better: if [[rich]] is installed, we render
-that Markdown locally; otherwise we fall back to the raw text.
+Interactive terminals can do better, and [[rich]] is now a required
+dependency, so we always render Markdown locally in that case.
 Using [[apply_markdown=False]] keeps both output modes based on the same
 Markdown source instead of rendered HTML.
 
-We keep [[rich]] optional.
-Importing it behind a [[try]]/[[except]] lets the command run unchanged
-without the extra while still enabling richer terminal output for
-[[zulipcli[rich]]].
-
-<<read imports>>=
-try:
-    from rich.console import Console
-    from rich.markdown import Markdown
-except ImportError:
-    Console = None
-    Markdown = None
-@
-
 Separating terminal detection from body rendering keeps
 [[_print_read_message()]] focused on record formatting.
-It also makes the three cases easy to verify in tests: raw piped output,
-rich rendering on a TTY, and raw fallback when [[rich]] is absent.
+It also makes the two output modes easy to verify in tests: raw piped
+output and rich rendering on a TTY.
 
 <<functions>>=
 def _stdout_is_tty():
@@ -706,10 +1080,11 @@ def _stdout_is_tty():
 <<functions>>=
 def _print_read_content(content):
     """Print Markdown content for the current stdout."""
-    if _stdout_is_tty() and Console is not None and Markdown is not None:
+    if _stdout_is_tty():
         Console(file=sys.stdout).print(Markdown(content))
     else:
         print(content)
+@
 
 <<functions>>=
 def _print_read_message(message):
@@ -746,11 +1121,7 @@ def read_command(client, args):
 
     found_newest = False
     while not found_newest:
-        result = client.get_messages(request)
-        if result["result"] != "success":
-            print(f"Error: {result.get('msg', 'unknown error')}",
-                  file=sys.stderr)
-            sys.exit(1)
+        result = _require_success(client.get_messages(request))
 
         found_newest = result["found_newest"]
         if result["messages"]:
@@ -799,7 +1170,7 @@ def test_read_stream_uses_stream_name(capsys, monkeypatch):
 
     client = MagicMock()
     client.get_messages.side_effect = get_messages
-    args = argparse.Namespace(stream="general", topic=None)
+    args = SimpleNamespace(stream="general", topic=None)
     monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
     read_command(client, args)
 
@@ -820,8 +1191,8 @@ def test_read_stream_uses_stream_name(capsys, monkeypatch):
     )
 @
 
-We should also verify that interactive terminals render Markdown when
-the optional [[rich]] dependency is available.
+We should also verify that interactive terminals render Markdown through
+[[rich]].
 
 <<test functions>>=
 def test_read_renders_markdown_on_tty(capsys, monkeypatch):
@@ -852,7 +1223,7 @@ def test_read_renders_markdown_on_tty(capsys, monkeypatch):
 
     client = MagicMock()
     client.get_messages.return_value = response
-    args = argparse.Namespace(stream="general", topic=None)
+    args = SimpleNamespace(stream="general", topic=None)
     monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
     monkeypatch.setattr(cli, "Console", FakeConsole)
     monkeypatch.setattr(cli, "Markdown", FakeMarkdown)
@@ -862,44 +1233,6 @@ def test_read_renders_markdown_on_tty(capsys, monkeypatch):
     assert output == (
         "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
         "rendered: *Hello stream*\n\n"
-    )
-@
-
-TTYs without [[rich]] should still keep working.
-In that case we fall back to the same raw Markdown that we use for
-non-interactive output.
-
-<<test functions>>=
-def test_read_tty_falls_back_to_raw_markdown_without_rich(
-    capsys,
-    monkeypatch,
-):
-    response = {
-        "result": "success",
-        "found_newest": True,
-        "messages": [
-            _make_stream_message(
-                1,
-                0,
-                "Alice Admin",
-                "Announcements",
-                "*Hello stream*",
-            ),
-        ],
-    }
-
-    client = MagicMock()
-    client.get_messages.return_value = response
-    args = argparse.Namespace(stream="general", topic=None)
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
-    monkeypatch.setattr(cli, "Console", None)
-    monkeypatch.setattr(cli, "Markdown", None)
-    read_command(client, args)
-
-    output = capsys.readouterr().out
-    assert output == (
-        "1970-01-01T00:00:00Z\tAlice Admin\tAnnouncements\n"
-        "*Hello stream*\n\n"
     )
 @
 
@@ -944,7 +1277,7 @@ def test_read_topic_pages_through_history(capsys, monkeypatch):
 
     client = MagicMock()
     client.get_messages.side_effect = get_messages
-    args = argparse.Namespace(
+    args = SimpleNamespace(
         stream="general",
         topic="release planning",
     )
@@ -983,7 +1316,7 @@ def test_read_reports_history_errors(capsys):
         "result": "error",
         "msg": "Invalid narrow operator",
     }
-    args = argparse.Namespace(stream="general", topic=None)
+    args = SimpleNamespace(stream="general", topic=None)
 
     with pytest.raises(SystemExit) as excinfo:
         read_command(client, args)
@@ -992,4 +1325,96 @@ def test_read_reports_history_errors(capsys):
     assert capsys.readouterr().err == (
         "Error: Invalid narrow operator\n"
     )
+@
+
+We can also verify the remaining completion cases: topics for a selected
+stream and direct-message recipients with full-name help text.
+
+<<test functions>>=
+def test_topic_completion_uses_stream_from_context(monkeypatch):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "success",
+        "topics": [
+            {"name": "Announcements"},
+            {"name": "Lab 1"},
+        ],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    result = complete_topic_names(
+        SimpleNamespace(params={"stream": "general"}),
+        ["read", "general", "A"],
+        "A",
+    )
+
+    assert result == ["Announcements"]
+    client.get_stream_id.assert_called_once_with("general")
+    client.get_stream_topics.assert_called_once_with(17)
+@
+
+<<test functions>>=
+def test_topic_completion_reads_send_stream_from_raw_args(monkeypatch):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "success",
+        "topics": [
+            {"name": "Announcements"},
+            {"name": "Lab 1"},
+        ],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    result = complete_topic_names(
+        SimpleNamespace(params={}),
+        ["send", "--stream", "general", "--topic", "A"],
+        "A",
+    )
+
+    assert result == ["Announcements"]
+@
+
+<<test functions>>=
+def test_user_completion_returns_email_with_full_name(monkeypatch):
+    client = MagicMock()
+    client.get_members.return_value = {
+        "result": "success",
+        "members": [
+            {
+                "full_name": "Alice Admin",
+                "email": "alice@example.com",
+                "is_active": True,
+            },
+            {
+                "full_name": "Bob Bot",
+                "email": "bot@example.com",
+                "is_active": False,
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    assert complete_user_emails(["send", "--to", "ali"], "ali") == [
+        ("alice@example.com", "Alice Admin")
+    ]
 @
