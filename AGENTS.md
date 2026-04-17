@@ -38,12 +38,6 @@ Common commands:
 - `make test`: regenerate sources, extract tests, and run pytest.
 - `poetry run pytest tests/`: run the extracted tests directly.
 
-This environment may hit Poetry keyring failures during install or other
-commands that touch package metadata.
-If that happens, prefix Poetry commands with:
-
-- `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring`
-
 ## Testing Model
 
 Tests live in the same `.nw` files as the implementation.
