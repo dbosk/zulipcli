@@ -1129,7 +1129,7 @@ def read_command(client, args):
             {"operator": "is", "operand": "unread"}
         )
 
-    printed_message_ids = []
+    printed_message_ids = [] if args.mark_as_read else None
     found_newest = False
     while not found_newest:
         result = _require_success(client.get_messages(request))
@@ -1138,10 +1138,11 @@ def read_command(client, args):
         if result["messages"]:
             for message in result["messages"]:
                 _print_read_message(message)
-                printed_message_ids.append(message["id"])
+                if printed_message_ids is not None:
+                    printed_message_ids.append(message["id"])
             request["anchor"] = result["messages"][-1]["id"] + 1
 
-    if args.mark_as_read and printed_message_ids:
+    if printed_message_ids:
         _require_success(client.update_message_flags({
             "messages": printed_message_ids,
             "op": "add",
@@ -1178,6 +1179,34 @@ def test_read_cli_passes_unread_and_mark_as_read_flags(monkeypatch):
     assert seen["args"].topic is None
     assert seen["args"].unread is True
     assert seen["args"].mark_as_read is True
+@
+
+We should also verify the default parser behaviour: without either flag,
+[[read]] should include all messages and leave them unread.
+
+<<test functions>>=
+def test_read_cli_defaults_to_all_messages_without_marking(monkeypatch):
+    seen = {}
+
+    def fake_read_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "read_command", fake_read_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, ["read", "general"])
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].stream == "general"
+    assert seen["args"].topic is None
+    assert seen["args"].unread is False
+    assert seen["args"].mark_as_read is False
 @
 
 Let's build a small helper for synthetic history payloads.
