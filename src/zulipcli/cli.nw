@@ -32,6 +32,7 @@ option names, and argument values.
 <<[[cli.py]]>>=
 """Command-line interface for Zulip."""
 
+import configparser
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -42,6 +43,7 @@ from typing import Annotated, Optional
 from rich.console import Console
 from rich.markdown import Markdown
 import typer
+import zulip
 
 import zulipcli
 
@@ -115,10 +117,18 @@ def _get_root_zuliprc(ctx: typer.Context):
     return params.get("zuliprc")
 @
 
+Client construction can fail before any API call if the configured
+[[zuliprc]] path is missing or malformed.
+Those failures are still ordinary command-line errors, so we report them
+through the same [[Error: ...]] path instead of showing a traceback.
+
 <<functions>>=
 def _get_client_from_context(ctx):
     """Create a Zulip client from the current Typer context."""
-    return zulipcli.get_client(_get_root_zuliprc(ctx))
+    try:
+        return zulipcli.get_client(_get_root_zuliprc(ctx))
+    except (configparser.Error, zulip.ZulipError) as error:
+        _exit_with_error(str(error))
 @
 
 The standalone and embedded applications share the same command
@@ -162,10 +172,10 @@ def build_embedded_app(
 @
 
 
-\section{Reporting Zulip API errors}
+\section{Reporting Zulip errors}
 
-The ordinary commands should all report Zulip API failures in the same
-way: print the server's message on stderr and exit with status [[1]].
+The ordinary commands should all report user-facing Zulip failures in
+the same way: print the message on stderr and exit with status [[1]].
 Factoring that policy into two helpers keeps each command focused on its
 own data handling instead of repeating the same error-checking branch.
 
@@ -378,6 +388,28 @@ def test_cli_passes_zuliprc_to_commands(monkeypatch):
     )
     assert result.exit_code == 0
     assert seen["zuliprc"] == "/tmp/custom.zuliprc"
+@
+
+<<test functions>>=
+def test_cli_reports_missing_zuliprc_without_traceback(monkeypatch):
+    def get_client(zuliprc=None):
+        raise cli.zulip.ConfigNotFoundError(
+            "api_key or email not specified and file "
+            "/tmp/missing.zuliprc does not exist"
+        )
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+
+    result = runner.invoke(
+        app,
+        ["--zuliprc", "/tmp/missing.zuliprc", "users"],
+    )
+
+    assert result.exit_code == 1
+    assert result.output == (
+        "Error: api_key or email not specified and file "
+        "/tmp/missing.zuliprc does not exist\n"
+    )
 @
 
 <<test functions>>=
