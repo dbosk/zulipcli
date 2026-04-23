@@ -56,16 +56,29 @@ def main():
 
 \section{Argument parsing}
 
-The top-level Typer application accepts a \texttt{-{}-zuliprc} option to
-override the default configuration file path.
-The callback stores that override in the root context, so each
+The module still exposes a standalone [[app]] whose callback accepts
+\texttt{-{}-zuliprc} to override the default configuration file path.
+That callback stores the resolved path in the root context, so each
 subcommand can ask one helper for a configured client.
 Typing the option as a [[Path]] also gives us filesystem completion for
 free.
 
+We also expose [[build_embedded_app()]] for host applications that want
+to mount the same command tree under their own subcommand name.
+The embedded form declares no root options, so the host can choose the
+mount name with [[add_typer()]] and populate [[ctx.obj["zuliprc"]]] in
+its own callback.
+The standalone form keeps Typer's completion-installation flags, while
+the embedded form disables them by default so the host owns that
+surface.
+
+<<constants>>=
+APP_HELP = "Command-line interface for Zulip"
+@
+
 <<functions>>=
 app = typer.Typer(
-    help="Command-line interface for Zulip",
+    help=APP_HELP,
     add_completion=True,
     no_args_is_help=True,
 )
@@ -84,17 +97,68 @@ def configure_app(
     ] = None,
 ):
     """Configure shared CLI options."""
-    ctx.obj = {
-        "zuliprc": None if zuliprc is None else str(zuliprc),
-    }
+    ctx.ensure_object(dict)
+    if zuliprc is not None:
+        ctx.obj["zuliprc"] = str(zuliprc)
+    else:
+        ctx.obj.setdefault("zuliprc", None)
+@
+
+<<functions>>=
+def _get_root_zuliprc(ctx: typer.Context):
+    """Return the zuliprc override stored in the root context."""
+    root_ctx = ctx.find_root()
+    obj = getattr(root_ctx, "obj", None) or {}
+    if "zuliprc" in obj:
+        return obj["zuliprc"]
+    params = getattr(root_ctx, "params", None) or {}
+    return params.get("zuliprc")
 @
 
 <<functions>>=
 def _get_client_from_context(ctx):
     """Create a Zulip client from the current Typer context."""
-    root_ctx = ctx.find_root()
-    obj = root_ctx.obj or {}
-    return zulipcli.get_client(obj.get("zuliprc"))
+    return zulipcli.get_client(_get_root_zuliprc(ctx))
+@
+
+The standalone and embedded applications share the same command
+handlers.
+We therefore build the embedded Typer application as a fresh object,
+normalise its context in a minimal callback, and register the shared
+handlers onto it.
+That keeps the standalone and embedded command surfaces aligned without
+forcing either form to own the other's root options.
+
+<<functions>>=
+def build_embedded_app(
+    *,
+    help: Optional[str] = None,
+    add_completion: bool = False,
+    no_args_is_help: bool = True,
+) -> typer.Typer:
+    """Return a Typer app suitable for mounting in another Typer app.
+
+    Example:
+        parent = typer.Typer()
+        parent.add_typer(build_embedded_app(), name="zulip")
+
+    The host callback should store the resolved zuliprc path in
+    ``ctx.obj["zuliprc"]`` before the embedded commands run.
+    """
+    embedded_app = typer.Typer(
+        help=APP_HELP if help is None else help,
+        add_completion=add_completion,
+        no_args_is_help=no_args_is_help,
+    )
+
+    @embedded_app.callback()
+    def configure_embedded_app(ctx: typer.Context):
+        """Prepare shared CLI state for embedded use."""
+        ctx.ensure_object(dict)
+        ctx.obj.setdefault("zuliprc", None)
+
+    _register_commands(embedded_app)
+    return embedded_app
 @
 
 
@@ -135,17 +199,17 @@ If the client cannot be created or a Zulip API request fails, we simply
 return no candidates.
 
 Typer also gives completion callbacks the parsed command context.
-That is enough for this CLI: the root context carries the top-level
-[[--zuliprc]] override, and the active command context already contains
-the selected stream for [[read TOPIC]] and [[send --topic TOPIC]].
+That is enough for this CLI: the root context carries the resolved
+[[zuliprc]] path, whether it came from the standalone [[--zuliprc]]
+option or a host application's callback, and the active command context
+already contains the selected stream for [[read TOPIC]] and
+[[send --topic TOPIC]].
 
 <<functions>>=
 def _get_completion_client(ctx: typer.Context):
     """Create a Zulip client for shell completion lookups."""
-    root_ctx = ctx.find_root()
-    zuliprc = (root_ctx.params or {}).get("zuliprc")
     try:
-        return zulipcli.get_client(zuliprc)
+        return zulipcli.get_client(_get_root_zuliprc(ctx))
     except Exception:
         return None
 @
@@ -249,9 +313,9 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
     return completions
 @
 
-Let's verify that the Typer application still shows help when invoked
-without a subcommand and that the shared [[--zuliprc]] option reaches
-both commands and completion callbacks.
+Let's verify both CLI entry styles: the standalone application still
+accepts [[--zuliprc]], while the embedded factory exposes the same
+subcommands without claiming that root option for itself.
 
 <<test [[cli.py]]>>=
 """Tests for zulipcli.cli."""
@@ -261,6 +325,7 @@ import io
 from types import SimpleNamespace
 
 import pytest
+import typer
 from click.shell_completion import _resolve_context, _resolve_incomplete
 from typer.main import get_command
 from typer.testing import CliRunner
@@ -316,6 +381,99 @@ def test_cli_passes_zuliprc_to_commands(monkeypatch):
 @
 
 <<test functions>>=
+def test_embedded_app_mounts_under_custom_name(monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    parent = typer.Typer()
+    parent.add_typer(cli.build_embedded_app(), name="zulip")
+
+    result = runner.invoke(parent, ["zulip", "streams"])
+
+    assert result.exit_code == 0
+    client.get_streams.assert_called_once_with()
+@
+
+<<test functions>>=
+def test_embedded_app_has_no_zuliprc_option():
+    command = get_command(cli.build_embedded_app())
+
+    assert "--zuliprc" not in {
+        option
+        for param in command.params
+        for option in getattr(param, "opts", [])
+    }
+@
+
+<<test functions>>=
+def test_embedded_app_reads_zuliprc_from_parent_ctx_obj(monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [],
+    }
+    seen = {}
+
+    def get_client(zuliprc=None):
+        seen["zuliprc"] = zuliprc
+        return client
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+
+    parent = typer.Typer()
+
+    @parent.callback()
+    def configure_parent(ctx: typer.Context):
+        ctx.ensure_object(dict)
+        ctx.obj["zuliprc"] = "/tmp/fake.zuliprc"
+
+    parent.add_typer(cli.build_embedded_app(), name="zulip")
+
+    result = runner.invoke(parent, ["zulip", "streams"])
+
+    assert result.exit_code == 0
+    assert seen["zuliprc"] == "/tmp/fake.zuliprc"
+@
+
+<<test functions>>=
+def test_standalone_app_still_has_zuliprc_option():
+    command = get_command(app)
+
+    assert "--zuliprc" in {
+        option
+        for param in command.params
+        for option in getattr(param, "opts", [])
+    }
+@
+
+<<test functions>>=
+def test_standalone_callback_preserves_existing_ctx_obj():
+    class DummyContext:
+        def __init__(self):
+            self.obj = {"course": "DD1337"}
+
+        def ensure_object(self, object_type):
+            if self.obj is None:
+                self.obj = object_type()
+            return self.obj
+
+    ctx = DummyContext()
+
+    cli.configure_app(ctx)
+
+    assert ctx.obj["course"] == "DD1337"
+    assert ctx.obj["zuliprc"] is None
+@
+
+<<test functions>>=
 def test_stream_completion_uses_zuliprc_override(monkeypatch):
     client = MagicMock()
     client.get_streams.return_value = {
@@ -331,7 +489,8 @@ def test_stream_completion_uses_zuliprc_override(monkeypatch):
     monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
     assert complete_stream_names(
         SimpleNamespace(find_root=lambda: SimpleNamespace(
-            params={"zuliprc": "/tmp/custom.zuliprc"},
+            obj={"zuliprc": "/tmp/custom.zuliprc"},
+            params={},
         )),
         "g",
     ) == ["general"]
@@ -372,8 +531,7 @@ By default we exclude bots and deactivated users, since the common use
 case is finding a human colleague's email address.
 
 <<functions>>=
-@app.command("users")
-def users(
+def _users_handler(
     ctx: typer.Context,
     pattern: Annotated[
         Optional[str],
@@ -563,8 +721,7 @@ Reading from stdin is useful for piping output from other commands
 directly into a Zulip message, which is a common scripting pattern.
 
 <<functions>>=
-@app.command("send")
-def send(
+def _send_handler(
     ctx: typer.Context,
     stream: Annotated[
         Optional[str],
@@ -794,8 +951,7 @@ on a server with many streams where the web interface's sidebar
 becomes unwieldy.
 
 <<functions>>=
-@app.command("streams")
-def streams(
+def _streams_handler(
     ctx: typer.Context,
     pattern: Annotated[
         Optional[str],
@@ -879,8 +1035,7 @@ identifier, so we first resolve the human-readable stream name via
 [[get_stream_id()]].
 
 <<functions>>=
-@app.command("topics")
-def topics(
+def _topics_handler(
     ctx: typer.Context,
     stream: Annotated[
         str,
@@ -1013,8 +1168,7 @@ HISTORY_BATCH_SIZE = 1000
 @
 
 <<functions>>=
-@app.command("read")
-def read(
+def _read_handler(
     ctx: typer.Context,
     stream: Annotated[
         str,
@@ -1056,6 +1210,26 @@ def read(
             mark_as_read=mark_as_read,
         ),
     )
+@
+
+The standalone and embedded applications must expose the same five
+subcommands.
+We therefore register the handlers through one helper that binds the
+shared command implementations to whichever [[typer.Typer]] instance we
+are constructing.
+
+<<functions>>=
+def _register_commands(target: typer.Typer) -> None:
+    """Register Zulip subcommands on ``target``."""
+    target.command("users")(_users_handler)
+    target.command("send")(_send_handler)
+    target.command("streams")(_streams_handler)
+    target.command("topics")(_topics_handler)
+    target.command("read")(_read_handler)
+@
+
+<<functions>>=
+_register_commands(app)
 @
 
 The output needs to stay readable for both a whole stream and a single
