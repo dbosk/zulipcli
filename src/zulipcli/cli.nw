@@ -48,6 +48,7 @@ from typing import Annotated, Optional
 
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.table import Table
 import typer
 import zulip
 
@@ -1901,6 +1902,253 @@ def test_send_cli_uses_stream_completion_and_dispatch(monkeypatch):
 @
 
 
+\section{Unread summaries for streams and topics}
+
+Unread membership is not part of [[get_streams()]] or
+[[get_stream_topics()]].
+We could reconstruct it by paging through [[get_messages()]], but that
+would turn two cheap discovery commands into full history scans. Zulip's
+event-queue registration already returns the unread summary that the web
+client uses, so we reuse that snapshot instead.
+
+Registering a queue still allocates server-side state.
+These commands only need the initial snapshot, so they fetch it once and
+then ask the server to delete the temporary queue immediately.
+Cleanup is best-effort: if the delete request itself fails, the queue will
+still expire automatically and the unread snapshot we already fetched is
+still useful.
+
+<<constants>>=
+UNREAD_EVENT_TYPES = ["message", "update_message_flags"]
+UNREAD_TOO_MANY = "too many"
+@
+
+<<functions>>=
+def _get_unread_topics_by_stream(client):
+    """Return unread topics grouped by stream ID."""
+    result = _require_success(client.register(
+        event_types=UNREAD_EVENT_TYPES,
+        client_gravatar=False,
+    ))
+    try:
+        unread_msgs = result.get("unread_msgs", {})
+        unread_topics = {}
+        for entry in unread_msgs.get("streams", []):
+            stream_topics = unread_topics.setdefault(
+                entry["stream_id"],
+                {},
+            )
+            stream_topics[entry["topic"]] = (
+                stream_topics.get(entry["topic"], 0)
+                + len(entry.get("unread_message_ids", []))
+            )
+        return unread_topics, unread_msgs.get(
+            "old_unreads_missing",
+            False,
+        )
+    finally:
+        queue_id = result.get("queue_id")
+        if queue_id:
+            try:
+                client.deregister(queue_id)
+            except Exception:
+                pass
+@
+
+When Zulip reports [[old_unreads_missing]], the stream/topic membership is
+still trustworthy enough for filtering, but the numeric counts are only a
+lower bound. In that case we print [[too many]] instead of a misleading
+integer.
+
+<<functions>>=
+def _format_unread_count(count, old_unreads_missing):
+    """Return display text for an unread count."""
+    if old_unreads_missing:
+        return UNREAD_TOO_MANY
+    return str(count)
+@
+
+Interactive terminals benefit from aligned columns and headers, while
+pipelines benefit from headerless tab-separated output. The unread-listing
+commands therefore render a borderless Rich table on a TTY and plain TSV
+everywhere else, preserving the silent \enquote{no results} convention
+when there is nothing to print.
+
+<<functions>>=
+def _print_unread_rows(name_header, rows):
+    """Print unread rows for the current stdout."""
+    if not rows:
+        return
+    if _stdout_is_tty():
+        table = Table(box=None, show_edge=False)
+        table.add_column(name_header)
+        table.add_column("Unread", justify="right")
+        for name, count in rows:
+            table.add_row(name, count)
+        Console(file=sys.stdout).print(table)
+    else:
+        for name, count in rows:
+            print(f"{name}\t{count}")
+@
+
+Let's verify that the unread snapshot helper groups counts by
+stream/topic, preserves the truncation flag, and deregisters the
+temporary queue.
+
+<<test functions>>=
+def test_get_unread_topics_by_stream_groups_counts_and_deregisters():
+    client = MagicMock()
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": True,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1, 2],
+                },
+                {
+                    "stream_id": 17,
+                    "topic": "Lab 1",
+                    "unread_message_ids": [3],
+                },
+                {
+                    "stream_id": 99,
+                    "topic": "Support",
+                    "unread_message_ids": [4, 5, 6],
+                },
+            ],
+        },
+    }
+
+    unread_topics, old_unreads_missing = (
+        cli._get_unread_topics_by_stream(client)
+    )
+
+    assert unread_topics == {
+        17: {"Announcements": 2, "Lab 1": 1},
+        99: {"Support": 3},
+    }
+    assert old_unreads_missing is True
+    client.register.assert_called_once_with(
+        event_types=cli.UNREAD_EVENT_TYPES,
+        client_gravatar=False,
+    )
+    client.deregister.assert_called_once_with("queue-123")
+@
+
+<<test functions>>=
+def test_get_unread_topics_by_stream_ignores_deregister_failures():
+    client = MagicMock()
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+        },
+    }
+    client.deregister.side_effect = RuntimeError("cleanup failed")
+
+    unread_topics, old_unreads_missing = (
+        cli._get_unread_topics_by_stream(client)
+    )
+
+    assert unread_topics == {17: {"Announcements": 1}}
+    assert old_unreads_missing is False
+    client.deregister.assert_called_once_with("queue-123")
+@
+
+<<test functions>>=
+def test_get_unread_topics_by_stream_reports_register_errors(capsys):
+    client = MagicMock()
+    client.register.return_value = {
+        "result": "error",
+        "msg": "Invalid API key",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._get_unread_topics_by_stream(client)
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == "Error: Invalid API key\n"
+    client.deregister.assert_not_called()
+@
+
+<<test functions>>=
+def test_print_unread_rows_uses_tsv_when_stdout_not_tty(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    cli._print_unread_rows("Stream", [
+        ("general", "3"),
+        ("random", "too many"),
+    ])
+
+    assert capsys.readouterr().out == (
+        "general\t3\n"
+        "random\ttoo many\n"
+    )
+@
+
+<<test functions>>=
+def test_print_unread_rows_uses_rich_table_on_tty(monkeypatch):
+    seen = {}
+
+    class FakeConsole:
+        def __init__(self, *, file):
+            seen["file"] = file
+
+        def print(self, table):
+            seen["headers"] = [column.header for column in table.columns]
+            seen["cells"] = [
+                list(column._cells) for column in table.columns
+            ]
+            seen["box"] = table.box
+            seen["show_edge"] = table.show_edge
+
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", FakeConsole)
+
+    cli._print_unread_rows("Topic", [("Lab 1", "2")])
+
+    assert seen["file"] is cli.sys.stdout
+    assert seen["headers"] == ["Topic", "Unread"]
+    assert seen["cells"] == [["Lab 1"], ["2"]]
+    assert seen["box"] is None
+    assert seen["show_edge"] is False
+@
+
+<<test functions>>=
+def test_print_unread_rows_is_silent_when_empty(monkeypatch):
+    called = {}
+
+    class FakeConsole:
+        def __init__(self, *, file):
+            called["constructed"] = True
+
+        def print(self, table):
+            called["printed"] = True
+
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", FakeConsole)
+
+    cli._print_unread_rows("Stream", [])
+
+    assert called == {}
+@
+
+
 \section{The \texttt{streams} subcommand}
 
 The [[streams]] subcommand lists all streams (channels) on the server.
@@ -1915,16 +2163,27 @@ def _streams_handler(
         Optional[str],
         typer.Argument(help="filter streams by name (regex)"),
     ] = None,
+    unread: Annotated[
+        bool,
+        typer.Option(
+            "--unread",
+            "-U",
+            help="only show streams with unread messages",
+        ),
+    ] = False,
 ):
     """List available streams."""
     streams_command(
         _get_client_from_context(ctx),
-        SimpleNamespace(pattern=pattern),
+        SimpleNamespace(pattern=pattern, unread=unread),
     )
 @
 
 Like the [[users]] command, we support an optional regex pattern for
-filtering and sort the output alphabetically for readability.
+filtering and sort the output alphabetically for readability. The unread
+view uses the unread summary helper above and sums per-topic counts back
+into per-stream counts, because Zulip reports unread channel state one
+topic at a time.
 
 <<functions>>=
 def streams_command(client, args):
@@ -1936,6 +2195,28 @@ def streams_command(client, args):
     else:
         pattern = None
 
+    if args.unread:
+        unread_topics, old_unreads_missing = (
+            _get_unread_topics_by_stream(client)
+        )
+        rows = []
+        for stream in sorted(result["streams"],
+                             key=lambda s: s["name"]):
+            if pattern and not pattern.search(stream["name"]):
+                continue
+            topics = unread_topics.get(stream["stream_id"])
+            if not topics:
+                continue
+            rows.append((
+                stream["name"],
+                _format_unread_count(
+                    sum(topics.values()),
+                    old_unreads_missing,
+                ),
+            ))
+        _print_unread_rows("Stream", rows)
+        return
+
     for stream in sorted(result["streams"],
                          key=lambda s: s["name"]):
         if pattern and not pattern.search(stream["name"]):
@@ -1944,6 +2225,29 @@ def streams_command(client, args):
 @
 
 Let's verify the streams command filters correctly.
+
+<<test functions>>=
+def test_streams_cli_passes_unread_flag(monkeypatch):
+    seen = {}
+
+    def fake_streams_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "streams_command", fake_streams_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, ["streams", "-U"])
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].pattern is None
+    assert seen["args"].unread is True
+@
 
 <<test functions>>=
 def test_streams_lists_all(capsys):
@@ -1956,7 +2260,7 @@ def test_streams_lists_all(capsys):
             {"name": "announcements"},
         ],
     }
-    args = SimpleNamespace(pattern=None)
+    args = SimpleNamespace(pattern=None, unread=False)
     streams_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
@@ -1974,13 +2278,130 @@ def test_streams_filters_by_pattern(capsys):
             {"name": "announcements"},
         ],
     }
-    args = SimpleNamespace(pattern="an")
+    args = SimpleNamespace(pattern="an", unread=False)
     streams_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
     assert "random" in lines
     assert "announcements" in lines
     assert "general" not in lines
+@
+
+Unread stream listing should collapse multiple unread topics inside the
+same stream into one row and keep the piped format script-friendly.
+
+<<test functions>>=
+def test_streams_unread_aggregates_topics_as_tsv(capsys, monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [
+            {"name": "announce", "stream_id": 19},
+            {"name": "general", "stream_id": 17},
+            {"name": "random", "stream_id": 18},
+        ],
+    }
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1, 2],
+                },
+                {
+                    "stream_id": 17,
+                    "topic": "Lab 1",
+                    "unread_message_ids": [3],
+                },
+                {
+                    "stream_id": 19,
+                    "topic": "Release",
+                    "unread_message_ids": [4],
+                },
+            ],
+        },
+    }
+    args = SimpleNamespace(pattern=None, unread=True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    streams_command(client, args)
+
+    output = capsys.readouterr().out.strip().split("\n")
+    assert output == ["announce\t1", "general\t3"]
+    client.deregister.assert_called_once_with("queue-123")
+@
+
+<<test functions>>=
+def test_streams_unread_filters_by_pattern(capsys, monkeypatch):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [
+            {"name": "announce", "stream_id": 19},
+            {"name": "general", "stream_id": 17},
+        ],
+    }
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1, 2],
+                },
+                {
+                    "stream_id": 19,
+                    "topic": "Release",
+                    "unread_message_ids": [3],
+                },
+            ],
+        },
+    }
+    args = SimpleNamespace(pattern="gen", unread=True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    streams_command(client, args)
+
+    assert capsys.readouterr().out == "general\t2\n"
+@
+
+<<test functions>>=
+def test_streams_unread_uses_too_many_when_summary_is_truncated(
+    capsys,
+    monkeypatch,
+):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [{"name": "general", "stream_id": 17}],
+    }
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": True,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1, 2],
+                },
+            ],
+        },
+    }
+    args = SimpleNamespace(pattern=None, unread=True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    streams_command(client, args)
+
+    assert capsys.readouterr().out == "general\ttoo many\n"
 @
 
 
@@ -2002,26 +2423,55 @@ def _topics_handler(
             autocompletion=complete_stream_names,
         ),
     ],
+    unread: Annotated[
+        bool,
+        typer.Option(
+            "--unread",
+            "-U",
+            help="only show topics with unread messages",
+        ),
+    ] = False,
 ):
     """List topics in a stream."""
     topics_command(
         _get_client_from_context(ctx),
-        SimpleNamespace(stream=stream),
+        SimpleNamespace(stream=stream, unread=unread),
     )
 @
 
 Resolving the stream name first keeps the CLI ergonomic while still
 using the API endpoint that returns the topic list accessible to the
-current user.
-We sort the output alphabetically so repeated invocations remain stable
-and easy to pipe through other tools.
+current user. The unread view still starts with [[get_stream_id()]] for
+the same validation step, but then reuses the unread summary helper
+rather than calling [[get_stream_topics()]], because only the summary
+carries unread membership and counts.
+We sort both output modes alphabetically so repeated invocations remain
+stable and easy to pipe through other tools.
 
 <<functions>>=
 def topics_command(client, args):
     """List topics in a stream."""
     result = _require_success(client.get_stream_id(args.stream))
 
-    result = _require_success(client.get_stream_topics(result["stream_id"]))
+    stream_id = result["stream_id"]
+
+    if args.unread:
+        unread_topics, old_unreads_missing = (
+            _get_unread_topics_by_stream(client)
+        )
+        rows = []
+        for topic_name in sorted(unread_topics.get(stream_id, {})):
+            rows.append((
+                topic_name,
+                _format_unread_count(
+                    unread_topics[stream_id][topic_name],
+                    old_unreads_missing,
+                ),
+            ))
+        _print_unread_rows("Topic", rows)
+        return
+
+    result = _require_success(client.get_stream_topics(stream_id))
 
     for topic in sorted(result["topics"], key=lambda t: t["name"]):
         print(topic["name"])
@@ -2029,6 +2479,29 @@ def topics_command(client, args):
 
 Let's verify that topic listing resolves the stream name and sorts the
 topics.
+
+<<test functions>>=
+def test_topics_cli_passes_unread_flag(monkeypatch):
+    seen = {}
+
+    def fake_topics_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "topics_command", fake_topics_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, ["topics", "-U", "general"])
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].stream == "general"
+    assert seen["args"].unread is True
+@
 
 <<test functions>>=
 def test_topics_lists_topics_in_sorted_order(capsys):
@@ -2045,7 +2518,7 @@ def test_topics_lists_topics_in_sorted_order(capsys):
             {"name": "Lab 1"},
         ],
     }
-    args = SimpleNamespace(stream="general")
+    args = SimpleNamespace(stream="general", unread=False)
     topics_command(client, args)
     output = capsys.readouterr().out
     lines = output.strip().split("\n")
@@ -2064,7 +2537,7 @@ def test_topics_reports_stream_lookup_errors(capsys):
         "result": "error",
         "msg": "Invalid channel name 'general'",
     }
-    args = SimpleNamespace(stream="general")
+    args = SimpleNamespace(stream="general", unread=False)
 
     with pytest.raises(SystemExit) as excinfo:
         topics_command(client, args)
@@ -2087,13 +2560,59 @@ def test_topics_reports_topic_lookup_errors(capsys):
         "result": "error",
         "msg": "Invalid channel ID",
     }
-    args = SimpleNamespace(stream="general")
+    args = SimpleNamespace(stream="general", unread=False)
 
     with pytest.raises(SystemExit) as excinfo:
         topics_command(client, args)
 
     assert excinfo.value.code == 1
     assert capsys.readouterr().err == "Error: Invalid channel ID\n"
+@
+
+Unread topic listing should stay within the selected stream and avoid the
+full topic-history endpoint.
+
+<<test functions>>=
+def test_topics_unread_lists_topics_as_tsv(capsys, monkeypatch):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 17,
+    }
+    client.register.return_value = {
+        "result": "success",
+        "queue_id": "queue-123",
+        "unread_msgs": {
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Weekly check-in",
+                    "unread_message_ids": [3],
+                },
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1, 2],
+                },
+                {
+                    "stream_id": 99,
+                    "topic": "Support",
+                    "unread_message_ids": [4],
+                },
+            ],
+        },
+    }
+    args = SimpleNamespace(stream="general", unread=True)
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    topics_command(client, args)
+
+    output = capsys.readouterr().out.strip().split("\n")
+    assert output == ["Announcements\t2", "Weekly check-in\t1"]
+    client.get_stream_id.assert_called_once_with("general")
+    client.get_stream_topics.assert_not_called()
+    client.deregister.assert_called_once_with("queue-123")
 @
 
 
