@@ -314,6 +314,13 @@ A user whose name, Zulip email, and delivery email all share the
 same prefix therefore appears up to three times---one candidate per
 field---which is what bash needs to actually show the name.
 
+When two of a member's fields collide (bots often have
+[[email == delivery_email]], for instance), emitting the same
+\emph{value} twice buys nothing: the shell inserts the same string
+either way, help text is attached to whichever row the shell picks,
+and the duplicate is just visual noise.
+We therefore track the values already emitted and skip repeats.
+
 <<functions>>=
 def complete_user_emails(ctx: typer.Context, incomplete: str):
     """Autocomplete direct-message recipients."""
@@ -326,6 +333,7 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
         return []
 
     completions = []
+    seen_values = set()
     for member in sorted(
         result["members"],
         key=lambda member: member["full_name"].casefold(),
@@ -337,13 +345,17 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
         full_name = member["full_name"]
         delivery_email = member.get("delivery_email") or ""
 
-        if _matches_completion(full_name, incomplete):
-            completions.append((full_name, email))
-        if _matches_completion(email, incomplete):
-            completions.append((email, full_name))
-        if delivery_email \
-                and _matches_completion(delivery_email, incomplete):
-            completions.append((delivery_email, full_name))
+        for value, help_text in (
+            (full_name, email),
+            (email, full_name),
+            (delivery_email, full_name),
+        ):
+            if not value or value in seen_values:
+                continue
+            if not _matches_completion(value, incomplete):
+                continue
+            completions.append((value, help_text))
+            seen_values.add(value)
     return completions
 @
 
@@ -1510,20 +1522,22 @@ Second, tests for the fan-out behaviour can then drive this helper
 directly without having to fake a message body or a confirmation
 prompt.
 
-Bots and deactivated accounts are excluded unconditionally; sending a
-DM to a bot or a disabled user is almost always a mistake and the
-command has no flag equivalent to [[users list --include-bots]].
+Deactivated accounts are excluded because sending to a disabled user
+is always a mistake.
+Bots are \emph{not} excluded: Zulip treats bot DMs as a first-class
+feature---reminder bots, Q\&A bots, and webhook bots all rely on
+humans being able to message them directly.
+If the regex matches a bot, the bot should receive the DM just like
+any other recipient.
 
 <<functions>>=
 def _resolve_direct_recipients(client, pattern_str):
-    """Return active non-bot members whose fields match the regex."""
+    """Return active members whose fields match the regex."""
     result = _require_success(client.get_users())
     pattern = re.compile(pattern_str, re.IGNORECASE)
     matches = []
     for member in sorted(result["members"],
                          key=lambda m: m["full_name"]):
-        if member.get("is_bot", False):
-            continue
         if not member.get("is_active", True):
             continue
         haystacks = [
@@ -1755,17 +1769,21 @@ def test_send_direct_message_errors_when_no_match(capsys):
     client.send_message.assert_not_called()
 @
 
-Bots and deactivated users are excluded from the match set even when
-the regex would hit them, so [[--to '.*']] on a default fixture
-reaches only the active humans.
+Deactivated users are excluded from the match set even when the
+regex would hit them, but bots are included so interactive bots
+remain reachable from the CLI.
 
 <<test functions>>=
-def test_send_direct_message_excludes_bots_and_deactivated():
+def test_send_direct_message_includes_bots_and_excludes_deactivated():
     client = MagicMock()
     client.get_users.return_value = _make_members()
     recipients = cli._resolve_direct_recipients(client, ".*")
     emails = [m["email"] for m in recipients]
-    assert emails == ["alice@example.com", "diana@example.com"]
+    assert emails == [
+        "alice@example.com",
+        "bob-bot@example.com",
+        "diana@example.com",
+    ]
 @
 
 A multi-match send on a pipe (non-TTY stdin) without [[--yes]] must
@@ -2820,6 +2838,39 @@ def test_user_completion_returns_full_name_for_name_only_prefix(
         SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
         "Dan",
     ) == [("Daniel Bosk", "user1054485@example.zulipchat.com")]
+@
+
+When a member's Zulip email and delivery email are the same string
+(the common shape for bots), the prefix must not produce two
+identical candidates---the shell would just show the same row twice.
+
+<<test functions>>=
+def test_user_completion_dedupes_identical_values(monkeypatch):
+    client = MagicMock()
+    client.get_users.return_value = {
+        "result": "success",
+        "members": [
+            {
+                "full_name": "Q Bot",
+                "email": "q-bot@example.zulipchat.com",
+                "delivery_email": "q-bot@example.zulipchat.com",
+                "is_active": True,
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    assert complete_user_emails(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+        "q",
+    ) == [
+        ("Q Bot", "q-bot@example.zulipchat.com"),
+        ("q-bot@example.zulipchat.com", "Q Bot"),
+    ]
 @
 
 <<test functions>>=
