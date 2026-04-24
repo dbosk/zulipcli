@@ -293,17 +293,26 @@ def complete_topic_names(ctx: typer.Context, incomplete: str):
     ]
 @
 
-Direct-message completion should return the email address that Zulip
-expects, but humans recognise colleagues by name more easily than by
-address.
-We therefore return the Zulip email as the value and the full name as
-the help text for shells that can display it.
-The matcher checks all three fields shown by [[users list]]---full
-name, Zulip email, and delivery (real) email---so typing the prefix
-of any of them surfaces the same candidate.
-The \emph{value} stays the Zulip email because that is what Zulip's
-send-message API expects; [[delivery_email]] is a read-only
-convenience.
+Direct-message completion must cope with the fact that shells differ
+in how they render help text.
+Zsh (with descriptions) and fish display the second element of each
+[[(value, help)]] tuple next to the value; bash shows only the value
+and filters it against whatever the user has typed so far.
+A completion that returns [[(email, full_name)]] is therefore useless
+on bash when the user is typing a name: no email starts with
+\enquote{Dan}, so bash offers nothing---even though [[full_name]]
+would match.
+
+The fix is to emit one candidate per \emph{matching field} rather than
+one per user.
+If the user's prefix matches the full name, we return the full name as
+a value; if it matches the Zulip email, we return the email; if it
+matches the delivery (real) email, we return that.
+This works end-to-end because [[send --to]] is a regex: any of the
+three values is a valid input that resolves back to the same user.
+A user whose name, Zulip email, and delivery email all share the
+same prefix therefore appears up to three times---one candidate per
+field---which is what bash needs to actually show the name.
 
 <<functions>>=
 def complete_user_emails(ctx: typer.Context, incomplete: str):
@@ -327,13 +336,14 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
         email = member["email"]
         full_name = member["full_name"]
         delivery_email = member.get("delivery_email") or ""
-        if not (
-            _matches_completion(email, incomplete)
-            or _matches_completion(delivery_email, incomplete)
-            or _matches_completion(full_name, incomplete)
-        ):
-            continue
-        completions.append((email, full_name))
+
+        if _matches_completion(full_name, incomplete):
+            completions.append((full_name, email))
+        if _matches_completion(email, incomplete):
+            completions.append((email, full_name))
+        if delivery_email \
+                and _matches_completion(delivery_email, incomplete):
+            completions.append((delivery_email, full_name))
     return completions
 @
 
@@ -2737,8 +2747,15 @@ def test_topic_completion_silently_ignores_missing_stream(monkeypatch):
     client.get_stream_id.assert_not_called()
 @
 
+A prefix shared by the full name, Zulip email, and delivery email of
+one user should emit three candidates for that user---one per
+matching field---so bash (which cannot show help text) still surfaces
+every usable form of the recipient identifier.
+
 <<test functions>>=
-def test_user_completion_returns_email_with_full_name(monkeypatch):
+def test_user_completion_emits_one_candidate_per_matching_field(
+    monkeypatch,
+):
     client = MagicMock()
     client.get_users.return_value = {
         "result": "success",
@@ -2746,11 +2763,13 @@ def test_user_completion_returns_email_with_full_name(monkeypatch):
             {
                 "full_name": "Alice Admin",
                 "email": "alice@example.com",
+                "delivery_email": "alice.admin@corp.example",
                 "is_active": True,
             },
             {
                 "full_name": "Bob Bot",
                 "email": "bot@example.com",
+                "delivery_email": None,
                 "is_active": False,
             },
         ],
@@ -2764,7 +2783,43 @@ def test_user_completion_returns_email_with_full_name(monkeypatch):
     assert complete_user_emails(
         SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
         "ali",
-    ) == [("alice@example.com", "Alice Admin")]
+    ) == [
+        ("Alice Admin", "alice@example.com"),
+        ("alice@example.com", "Alice Admin"),
+        ("alice.admin@corp.example", "Alice Admin"),
+    ]
+@
+
+A prefix that only matches the name (not the Zulip email) is the
+crucial bash case; the single candidate returned must be the name
+itself.
+
+<<test functions>>=
+def test_user_completion_returns_full_name_for_name_only_prefix(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.get_users.return_value = {
+        "result": "success",
+        "members": [
+            {
+                "full_name": "Daniel Bosk",
+                "email": "user1054485@example.zulipchat.com",
+                "delivery_email": None,
+                "is_active": True,
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "get_client",
+        lambda zuliprc=None: client,
+    )
+
+    assert complete_user_emails(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+        "Dan",
+    ) == [("Daniel Bosk", "user1054485@example.zulipchat.com")]
 @
 
 <<test functions>>=
