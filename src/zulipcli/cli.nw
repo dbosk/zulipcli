@@ -19,7 +19,8 @@ stay flat because each speaks to a different Zulip concept:
   regex matched against name, Zulip email, and real (delivery) email.
 \item[users invited] List pending (unaccepted) invitations.
 \item[users invite] Invite one or more new users by email.
-\item[send] Send a message to a stream or directly to a user.
+\item[send] Send a message to a stream or directly to one or more users.
+\item[dm] Read direct-message history, optionally for one conversation.
 \item[streams] List available streams.
 \item[topics] List the topics inside a stream.
 \item[read] Read the history of a stream or one topic within it.
@@ -598,7 +599,7 @@ someone new?
 Grouping those verbs under a single [[users]] command family keeps
 the top-level namespace tidy and makes the relationship obvious from
 the help output.
-The three flat verbs that follow ([[send]], [[streams]], [[topics]],
+The flat verbs that follow ([[send]], [[dm]], [[streams]], [[topics]],
 [[read]]) each speak to a different Zulip concept and do not gain
 anything from further nesting.
 
@@ -670,6 +671,89 @@ We print tab-separated lines so [[grep]], [[cut]], and [[sort]]
 continue to work, and we print an empty field when Zulip withheld
 [[delivery_email]]---that keeps the column count stable for
 [[cut -f3]] consumers.
+
+Several commands in this file accept several regexes with the same
+semantics: compile them case-insensitively, OR them together, and emit
+each matching row only once.
+We centralise that policy here so [[users list]], [[send]], [[dm]], and
+[[streams]] all agree on what it means to match a set of regexes.
+
+<<functions>>=
+def _list_pattern_strs(pattern_strs):
+    """Return zero or more pattern strings as a list."""
+    if pattern_strs is None:
+        return []
+    if isinstance(pattern_strs, str):
+        return [pattern_strs]
+    return list(pattern_strs)
+@
+
+<<functions>>=
+def _compile_patterns(pattern_strs):
+    """Compile pattern strings as case-insensitive regexes."""
+    return [
+        re.compile(pattern_str, re.IGNORECASE)
+        for pattern_str in _list_pattern_strs(pattern_strs)
+    ]
+@
+
+<<functions>>=
+def _describe_patterns(pattern_strs):
+    """Return a human-readable description of pattern strings."""
+    pattern_strs = _list_pattern_strs(pattern_strs)
+    if len(pattern_strs) == 1:
+        return f"pattern {pattern_strs[0]!r}"
+    return f"patterns {pattern_strs!r}"
+@
+
+<<functions>>=
+def _matches_patterns(values, patterns):
+    """Return whether any value matches any compiled pattern."""
+    if not patterns:
+        return True
+    return any(
+        pattern.search(value)
+        for pattern in patterns
+        for value in values
+        if value
+    )
+@
+
+The member resolver applies the bot and activation filters before the
+regex checks, because those boolean tests are cheaper than a regex
+search and because every caller wants repeated or overlapping regexes to
+collapse to one row per matched user.
+
+<<functions>>=
+def _resolve_members_matching_patterns(
+    client,
+    pattern_strs,
+    *,
+    include_bots,
+    include_deactivated,
+):
+    """Return users matching the given patterns and account filters."""
+    result = _require_success(client.get_users())
+    patterns = _compile_patterns(pattern_strs)
+    matches = []
+    for member in sorted(result["members"],
+                         key=lambda m: m["full_name"]):
+        if not include_bots and member.get("is_bot", False):
+            continue
+        if not include_deactivated \
+                and not member.get("is_active", True):
+            continue
+        haystacks = [
+            member["full_name"],
+            member["email"],
+            member.get("delivery_email") or "",
+        ]
+        if not _matches_patterns(haystacks, patterns):
+            continue
+        matches.append(member)
+    return matches
+@
+
 By default we exclude bots and deactivated users because the typical
 question is \enquote{who, on my team, can I reach right now?}.
 
@@ -677,11 +761,11 @@ question is \enquote{who, on my team, can I reach right now?}.
 @users_app.command("list")
 def _users_list_handler(
     ctx: typer.Context,
-    pattern: Annotated[
-        Optional[str],
+    patterns: Annotated[
+        Optional[list[str]],
         typer.Argument(
             help="filter users by name, email, or delivery "
-                 "email (regex)",
+                 "email (regex; repeat to OR several)",
         ),
     ] = None,
     include_bots: Annotated[
@@ -697,61 +781,36 @@ def _users_list_handler(
     users_list_command(
         _get_client_from_context(ctx),
         SimpleNamespace(
-            pattern=pattern,
+            patterns=patterns,
             include_bots=include_bots,
             include_deactivated=include_deactivated,
         ),
     )
 @
 
-The implementation fetches all members, applies the filters, and
-prints each matching user.
-We compile the pattern once (if given) and match it
-case-insensitively against the full name, Zulip email, and delivery
-email, so [[zulipcli users list bosk]] finds the user whether
-\enquote{bosk} appears in their display name, their Zulip handle, or
-their real mailbox.
+The implementation fetches all members through the shared resolver, so
+user-list filtering follows the same rules as direct-message targeting:
+case-insensitive regexes over the full name, Zulip email, and delivery
+email, ORed together when several are supplied.
 
 <<functions>>=
 def users_list_command(client, args):
-    """List users, optionally filtered by pattern."""
-    result = _require_success(client.get_users())
-
-    if args.pattern:
-        pattern = re.compile(args.pattern, re.IGNORECASE)
-    else:
-        pattern = None
-
-    for member in sorted(result["members"],
-                         key=lambda m: m["full_name"]):
-        <<skip filtered users>>
+    """List users, optionally filtered by one or more patterns."""
+    pattern_strs = getattr(
+        args,
+        "patterns",
+        getattr(args, "pattern", None),
+    )
+    for member in _resolve_members_matching_patterns(
+        client,
+        pattern_strs,
+        include_bots=args.include_bots,
+        include_deactivated=args.include_deactivated,
+    ):
         delivery = member.get("delivery_email") or ""
         print(
             f"{member['full_name']}\t{member['email']}\t{delivery}"
         )
-@
-
-We skip users that don't match the active filters.
-Order matters: cheap boolean checks first, then the regex.
-The pattern search ORs three haystacks so a match in any column
-passes; when [[delivery_email]] is absent or empty we simply exclude
-it from the haystack list rather than trying to match an empty
-string.
-
-<<skip filtered users>>=
-if not args.include_bots and member.get("is_bot", False):
-    continue
-if not args.include_deactivated \
-        and not member.get("is_active", True):
-    continue
-if pattern:
-    haystacks = [
-        member["full_name"],
-        member["email"],
-        member.get("delivery_email") or "",
-    ]
-    if not any(pattern.search(field) for field in haystacks if field):
-        continue
 @
 
 Let's build a small fixture that the three verbs share.
@@ -759,6 +818,8 @@ It includes one user whose delivery email differs from the Zulip
 email, two whose delivery email is empty (the common case when the
 caller is not an admin), and the usual bot and deactivated rows that
 exercise the default filters.
+The fixture also carries stable Zulip user IDs so the direct-message
+tests can assert the exact [[dm]] narrow we build.
 
 <<test functions>>=
 def _make_members():
@@ -767,6 +828,7 @@ def _make_members():
         "result": "success",
         "members": [
             {
+                "user_id": 1,
                 "full_name": "Alice Admin",
                 "email": "alice@example.com",
                 "delivery_email": "alice.admin@corp.example",
@@ -774,6 +836,7 @@ def _make_members():
                 "is_active": True,
             },
             {
+                "user_id": 2,
                 "full_name": "Bob Bot",
                 "email": "bob-bot@example.com",
                 "delivery_email": None,
@@ -781,6 +844,7 @@ def _make_members():
                 "is_active": True,
             },
             {
+                "user_id": 3,
                 "full_name": "Charlie Inactive",
                 "email": "charlie@example.com",
                 "delivery_email": "",
@@ -788,6 +852,7 @@ def _make_members():
                 "is_active": False,
             },
             {
+                "user_id": 4,
                 "full_name": "Diana Developer",
                 "email": "diana@example.com",
                 "delivery_email": "",
@@ -877,6 +942,24 @@ def test_users_list_pattern_filters_by_delivery_email(capsys):
     assert "Diana Developer" not in output
 @
 
+Repeated and overlapping regexes are ORed together, but a user that
+matches several of them should still appear only once.
+
+<<test functions>>=
+def test_users_list_patterns_or_together_without_duplicates(capsys):
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+    args = SimpleNamespace(
+        patterns=["alice", "alice.admin@corp"],
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_list_command(client, args)
+    assert capsys.readouterr().out.strip().split("\n") == [
+        "Alice Admin\talice@example.com\talice.admin@corp.example",
+    ]
+@
+
 We also verify the stable three-column output so scripts relying on
 [[cut -f3]] do not have to special-case rows with a hidden delivery
 email.
@@ -958,36 +1041,39 @@ An empty invitation list prints nothing, matching the silent
 @users_app.command("invited")
 def _users_invited_handler(
     ctx: typer.Context,
-    pattern: Annotated[
-        Optional[str],
+    patterns: Annotated[
+        Optional[list[str]],
         typer.Argument(
-            help="filter invitations by invitee email (regex)",
+            help="filter invitations by invitee email "
+                 "(regex; repeat to OR several)",
         ),
     ] = None,
 ):
     """List pending (unaccepted) invitations."""
     users_invited_command(
         _get_client_from_context(ctx),
-        SimpleNamespace(pattern=pattern),
+        SimpleNamespace(patterns=patterns),
     )
 @
 
 <<functions>>=
 def users_invited_command(client, args):
-    """List pending invitations, optionally filtered by email."""
+    """List pending invitations, optionally filtered by regexes."""
     result = _require_success(client.call_endpoint(
         url="invites",
         method="GET",
     ))
 
-    if args.pattern:
-        pattern = re.compile(args.pattern, re.IGNORECASE)
-    else:
-        pattern = None
+    pattern_strs = getattr(
+        args,
+        "patterns",
+        getattr(args, "pattern", None),
+    )
+    patterns = _compile_patterns(pattern_strs)
 
     for invite in sorted(result.get("invites", []),
                          key=lambda inv: inv["email"]):
-        if pattern and not pattern.search(invite["email"]):
+        if not _matches_patterns([invite["email"]], patterns):
             continue
         print(_format_invitation_row(invite))
 @
@@ -1082,6 +1168,45 @@ def test_users_invited_filters_by_email(capsys):
     output = capsys.readouterr().out
     assert "keep@example.com" in output
     assert "drop@example.com" not in output
+@
+
+Invitation filters use the same OR semantics when several regexes are
+supplied.
+
+<<test functions>>=
+def test_users_invited_filters_by_several_patterns(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invites": [
+            {
+                "email": "ann@example.com",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+            {
+                "email": "bob@example.com",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+            {
+                "email": "carol@example.com",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+        ],
+    }
+    users_invited_command(
+        client,
+        SimpleNamespace(patterns=["^ann", "bob@"]),
+    )
+    assert capsys.readouterr().out.strip().split("\n") == [
+        "ann@example.com\t\tmember\t5",
+        "bob@example.com\t\tmember\t5",
+    ]
 @
 
 <<test functions>>=
@@ -1379,9 +1504,10 @@ standard input.
 Reading from stdin is useful for piping output from other commands
 directly into a Zulip message, which is a common scripting pattern.
 
-The [[--to]] value is a regex matched against every active non-bot
-user's full name, Zulip email, and delivery email; all matches
-receive the message.
+The [[--to]] option can be repeated.
+Each occurrence is a regex matched against every active user's full
+name, Zulip email, and delivery email; the union of all matches
+receives the message.
 This turns \enquote{DM everyone in the Alice team} into a one-liner
 instead of forcing the caller to copy--paste addresses, and makes a
 single-address send work the same way (any valid email is itself a
@@ -1412,11 +1538,11 @@ def _send_handler(
         ),
     ] = None,
     to: Annotated[
-        Optional[str],
+        Optional[list[str]],
         typer.Option(
-            help="direct-message recipient: regex matched against "
-                 "full name, Zulip email, and delivery email "
-                 "(all matches receive the message)",
+            help="direct-message recipient regex; repeat to OR "
+                 "several patterns over full name, Zulip email, "
+                 "and delivery email",
             autocompletion=complete_user_emails,
         ),
     ] = None,
@@ -1489,8 +1615,9 @@ _require_success(client.send_message(request))
 Direct messages use the [[direct]] type (called [[private]] in older
 API versions).
 The [[to]] field on the wire accepts a list of Zulip emails; our
-resolver turns the caller's regex into that list and asks for
-confirmation when more than one user is about to be messaged.
+resolver turns the caller's regexes into that list, deduplicates any
+overlap between them, and asks for confirmation when more than one user
+is about to be messaged.
 A match on [[delivery_email]] still sends to the matched user's Zulip
 [[email]], because the API expects the registered address rather than
 the user's mailbox.
@@ -1499,7 +1626,7 @@ the user's mailbox.
 recipients = _resolve_direct_recipients(client, args.to)
 if not recipients:
     _exit_with_error(
-        f"--to pattern {args.to!r} matched no active users"
+        f"--to {_describe_patterns(args.to)} matched no active users"
     )
 if len(recipients) > 1 and not _confirm_recipients(
     recipients,
@@ -1517,11 +1644,11 @@ _require_success(client.send_message(request))
 
 We factor the resolution into its own helper for two reasons.
 First, the regex semantics already drive the help text of [[--to]]
-and the completion helper, and collecting the logic in one place
-keeps all three aligned.
-Second, tests for the fan-out behaviour can then drive this helper
-directly without having to fake a message body or a confirmation
-prompt.
+and the completion helper, and collecting the logic in one place keeps
+all three aligned.
+Second, repeated or overlapping regexes should still produce one
+recipient row per matched user, which is exactly the same policy that
+[[users list]] and [[dm]] want.
 
 Deactivated accounts are excluded because sending to a disabled user
 is always a mistake.
@@ -1532,23 +1659,14 @@ If the regex matches a bot, the bot should receive the DM just like
 any other recipient.
 
 <<functions>>=
-def _resolve_direct_recipients(client, pattern_str):
-    """Return active members whose fields match the regex."""
-    result = _require_success(client.get_users())
-    pattern = re.compile(pattern_str, re.IGNORECASE)
-    matches = []
-    for member in sorted(result["members"],
-                         key=lambda m: m["full_name"]):
-        if not member.get("is_active", True):
-            continue
-        haystacks = [
-            member["full_name"],
-            member["email"],
-            member.get("delivery_email") or "",
-        ]
-        if any(pattern.search(field) for field in haystacks if field):
-            matches.append(member)
-    return matches
+def _resolve_direct_recipients(client, pattern_strs):
+    """Return active members whose fields match one or more regexes."""
+    return _resolve_members_matching_patterns(
+        client,
+        pattern_strs,
+        include_bots=True,
+        include_deactivated=False,
+    )
 @
 
 The confirmation helper prints the matched recipients to stderr so
@@ -1741,6 +1859,33 @@ def test_send_direct_message_matches_by_delivery_email():
         "type": "direct",
         "to": ["alice@example.com"],
         "content": "Hi via real email",
+    })
+@
+
+Overlapping recipient regexes should still resolve each matched user only
+once.
+
+<<test functions>>=
+def test_send_direct_message_dedupes_overlapping_patterns():
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+    client.send_message.return_value = {"result": "success"}
+
+    send_command(
+        client,
+        SimpleNamespace(
+            stream=None,
+            topic=None,
+            to=["Alice", "alice.admin@corp"],
+            yes=False,
+            message="Hi once",
+        ),
+    )
+
+    client.send_message.assert_called_once_with({
+        "type": "direct",
+        "to": ["alice@example.com"],
+        "content": "Hi once",
     })
 @
 
@@ -2159,9 +2304,11 @@ becomes unwieldy.
 <<functions>>=
 def _streams_handler(
     ctx: typer.Context,
-    pattern: Annotated[
-        Optional[str],
-        typer.Argument(help="filter streams by name (regex)"),
+    patterns: Annotated[
+        Optional[list[str]],
+        typer.Argument(
+            help="filter streams by name (regex; repeat to OR several)",
+        ),
     ] = None,
     unread: Annotated[
         bool,
@@ -2175,25 +2322,28 @@ def _streams_handler(
     """List available streams."""
     streams_command(
         _get_client_from_context(ctx),
-        SimpleNamespace(pattern=pattern, unread=unread),
+        SimpleNamespace(patterns=patterns, unread=unread),
     )
 @
 
-Like the [[users]] command, we support an optional regex pattern for
-filtering and sort the output alphabetically for readability. The unread
-view uses the unread summary helper above and sums per-topic counts back
-into per-stream counts, because Zulip reports unread channel state one
-topic at a time.
+Like the user-targeting commands, [[streams]] accepts zero or more regex
+patterns and ORs them together.
+We still sort the output alphabetically for readability.
+The unread view uses the unread summary helper above and sums per-topic
+counts back into per-stream counts, because Zulip reports unread channel
+state one topic at a time.
 
 <<functions>>=
 def streams_command(client, args):
     """List available streams."""
     result = _require_success(client.get_streams())
 
-    if args.pattern:
-        pattern = re.compile(args.pattern, re.IGNORECASE)
-    else:
-        pattern = None
+    pattern_strs = getattr(
+        args,
+        "patterns",
+        getattr(args, "pattern", None),
+    )
+    patterns = _compile_patterns(pattern_strs)
 
     if args.unread:
         unread_topics, old_unreads_missing = (
@@ -2202,7 +2352,7 @@ def streams_command(client, args):
         rows = []
         for stream in sorted(result["streams"],
                              key=lambda s: s["name"]):
-            if pattern and not pattern.search(stream["name"]):
+            if not _matches_patterns([stream["name"]], patterns):
                 continue
             topics = unread_topics.get(stream["stream_id"])
             if not topics:
@@ -2219,7 +2369,7 @@ def streams_command(client, args):
 
     for stream in sorted(result["streams"],
                          key=lambda s: s["name"]):
-        if pattern and not pattern.search(stream["name"]):
+        if not _matches_patterns([stream["name"]], patterns):
             continue
         print(stream["name"])
 @
@@ -2227,7 +2377,7 @@ def streams_command(client, args):
 Let's verify the streams command filters correctly.
 
 <<test functions>>=
-def test_streams_cli_passes_unread_flag(monkeypatch):
+def test_streams_cli_passes_patterns_and_unread_flag(monkeypatch):
     seen = {}
 
     def fake_streams_command(client, args):
@@ -2241,11 +2391,11 @@ def test_streams_cli_passes_unread_flag(monkeypatch):
         lambda ctx: "client",
     )
 
-    result = runner.invoke(app, ["streams", "-U"])
+    result = runner.invoke(app, ["streams", "-U", "gen", "ann"])
 
     assert result.exit_code == 0
     assert seen["client"] == "client"
-    assert seen["args"].pattern is None
+    assert seen["args"].patterns == ["gen", "ann"]
     assert seen["args"].unread is True
 @
 
@@ -2285,6 +2435,28 @@ def test_streams_filters_by_pattern(capsys):
     assert "random" in lines
     assert "announcements" in lines
     assert "general" not in lines
+@
+
+Several stream patterns are ORed together just like the user-selection
+commands.
+
+<<test functions>>=
+def test_streams_filters_by_several_patterns(capsys):
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [
+            {"name": "general"},
+            {"name": "random"},
+            {"name": "announcements"},
+        ],
+    }
+    args = SimpleNamespace(patterns=["^ann", "dom$"], unread=False)
+    streams_command(client, args)
+    assert capsys.readouterr().out.strip().split("\n") == [
+        "announcements",
+        "random",
+    ]
 @
 
 Unread stream listing should collapse multiple unread topics inside the
@@ -2616,6 +2788,334 @@ def test_topics_unread_lists_topics_as_tsv(capsys, monkeypatch):
 @
 
 
+\section{The \texttt{dm} subcommand}
+
+The [[dm]] command mirrors [[read]], but for direct messages instead of
+stream history.
+With no positional arguments it reads every direct message visible in the
+current user's personal history; with one or more [[USER]] regexes it
+resolves those users and narrows to the exact 1:1 or group conversation
+with that set of participants.
+
+Zulip's search model makes the conversation case especially clean:
+[[dm]] accepts a list of user IDs, and the server treats that list as an
+order-insensitive conversation identity.
+That means repeated or overlapping regexes can be silently deduplicated
+before we build the narrow, with no ambiguity about which conversation we
+mean.
+
+<<functions>>=
+def _dm_handler(
+    ctx: typer.Context,
+    users: Annotated[
+        Optional[list[str]],
+        typer.Argument(
+            help="direct-message participant regex; repeat to OR "
+                 "several patterns over full name, Zulip email, "
+                 "and delivery email",
+            autocompletion=complete_user_emails,
+        ),
+    ] = None,
+    unread: Annotated[
+        bool,
+        typer.Option(
+            "--unread",
+            "-U",
+            help="only show unread messages",
+        ),
+    ] = False,
+    mark_as_read: Annotated[
+        bool,
+        typer.Option(
+            "--mark-as-read/--no-mark-as-read",
+            help="mark printed messages as read",
+        ),
+    ] = False,
+):
+    """Read direct messages."""
+    dm_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            users=users,
+            unread=unread,
+            mark_as_read=mark_as_read,
+        ),
+    )
+@
+
+The direct-message reader reuses the same member resolver as [[send]], so
+regexes over full names, Zulip emails, and delivery emails behave the
+same everywhere.
+Bots stay eligible participants, deactivated accounts do not, and a
+conversation narrow is only built after repeated matches have collapsed
+to one stable-sorted user-ID list.
+
+<<functions>>=
+def _dm_narrow_for_users(client, user_patterns):
+    """Return a Zulip narrow for all DMs or one DM conversation."""
+    if not user_patterns:
+        return [{"operator": "is", "operand": "dm"}]
+
+    users = _resolve_direct_recipients(client, user_patterns)
+    if not users:
+        _exit_with_error(
+            f"dm {_describe_patterns(user_patterns)} matched "
+            "no active users"
+        )
+
+    return [{
+        "operator": "dm",
+        "operand": [user["user_id"] for user in users],
+    }]
+@
+
+<<functions>>=
+def dm_command(client, args):
+    """Read direct messages, optionally for one conversation."""
+    narrow = _dm_narrow_for_users(client, args.users)
+    if args.unread:
+        narrow.append({"operator": "is", "operand": "unread"})
+    _read_messages(client, narrow, mark_as_read=args.mark_as_read)
+@
+
+Let's verify that the CLI forwards participant regexes as well as the
+unread and acknowledgement flags.
+
+<<test functions>>=
+def test_dm_cli_passes_users_unread_and_mark_as_read_flags(monkeypatch):
+    seen = {}
+
+    def fake_dm_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "dm_command", fake_dm_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(
+        app,
+        ["dm", "-U", "--mark-as-read", "alice", "diana"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].users == ["alice", "diana"]
+    assert seen["args"].unread is True
+    assert seen["args"].mark_as_read is True
+@
+
+Without user patterns we should read the caller's full DM history.
+
+<<test functions>>=
+def test_dm_narrow_without_users_reads_all_direct_messages():
+    client = MagicMock()
+
+    assert cli._dm_narrow_for_users(client, None) == [
+        {"operator": "is", "operand": "dm"},
+    ]
+    client.get_users.assert_not_called()
+@
+
+Supplying several patterns should OR them together and deduplicate
+overlap before building the exact conversation narrow.
+
+<<test functions>>=
+def test_dm_narrow_resolves_patterns_to_deduped_user_ids():
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+
+    assert cli._dm_narrow_for_users(
+        client,
+        ["diana", "alice", "alice.admin@corp"],
+    ) == [{
+        "operator": "dm",
+        "operand": [1, 4],
+    }]
+@
+
+An unmatched participant regex should fail with the same style of error
+message as [[send]].
+
+<<test functions>>=
+def test_dm_narrow_errors_when_no_user_matches(capsys):
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._dm_narrow_for_users(client, ["nobody"])
+
+    assert excinfo.value.code == 1
+    assert "matched no active users" in capsys.readouterr().err
+@
+
+Direct-message history needs a different header context from stream
+history, so we keep a tiny fixture helper for those payloads as well.
+
+<<test functions>>=
+def _make_dm_message(message_id, timestamp, sender, participants, content):
+    """Create a sample direct message for testing."""
+    return {
+        "id": message_id,
+        "timestamp": timestamp,
+        "sender_full_name": sender,
+        "type": "private",
+        "display_recipient": [
+            {
+                "id": index,
+                "email": f"user{index}@example.com",
+                "full_name": full_name,
+                "is_mirror_dummy": False,
+            }
+            for index, full_name in enumerate(participants, start=1)
+        ],
+        "content": content,
+    }
+@
+
+Reading all DMs should use Zulip's [[is:dm]] narrow and print the whole
+participant set in the third output column.
+
+<<test functions>>=
+def test_dm_reads_all_direct_messages_with_participant_context(
+    capsys,
+    monkeypatch,
+):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_dm_message(
+                1,
+                0,
+                "Alice Admin",
+                ["Me Myself", "Alice Admin"],
+                "Hello direct",
+            ),
+        ],
+    }
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return response
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    cli.dm_command(
+        client,
+        SimpleNamespace(users=None, unread=False, mark_as_read=False),
+    )
+
+    assert requests == [{
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [
+            {"operator": "is", "operand": "dm"},
+        ],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }]
+    assert capsys.readouterr().out == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tAlice Admin, Me Myself\n"
+        "Hello direct\n\n"
+    )
+    client.update_message_flags.assert_not_called()
+@
+
+The exact-conversation case should add the [[dm]] narrow operand and only
+mark messages after printing them all.
+
+<<test functions>>=
+def test_dm_unread_selected_conversation_marks_after_printing(
+    monkeypatch,
+):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_dm_message(
+                11,
+                0,
+                "Alice Admin",
+                [
+                    "Me Myself",
+                    "Diana Developer",
+                    "Alice Admin",
+                ],
+                "First direct message",
+            ),
+            _make_dm_message(
+                12,
+                60,
+                "Diana Developer",
+                [
+                    "Me Myself",
+                    "Diana Developer",
+                    "Alice Admin",
+                ],
+                "Second direct message",
+            ),
+        ],
+    }
+    requests = []
+    events = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return response
+
+    def print_message(message):
+        events.append(("print", message["id"]))
+
+    def update_message_flags(request):
+        events.append(("mark", copy.deepcopy(request)))
+        return {"result": "success"}
+
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+    client.get_messages.side_effect = get_messages
+    client.update_message_flags.side_effect = update_message_flags
+    monkeypatch.setattr(cli, "_print_read_message", print_message)
+
+    cli.dm_command(
+        client,
+        SimpleNamespace(
+            users=["diana", "alice.admin@corp"],
+            unread=True,
+            mark_as_read=True,
+        ),
+    )
+
+    assert requests == [{
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [
+            {"operator": "dm", "operand": [1, 4]},
+            {"operator": "is", "operand": "unread"},
+        ],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }]
+    assert events == [
+        ("print", 11),
+        ("print", 12),
+        ("mark", {
+            "messages": [11, 12],
+            "op": "add",
+            "flag": "read",
+        }),
+    ]
+@
+
+
 \section{The \texttt{read} subcommand}
 
 The [[read]] command reads the complete history of a stream or one
@@ -2702,6 +3202,7 @@ def _register_commands(target: typer.Typer) -> None:
     """Register Zulip subcommands on ``target``."""
     target.add_typer(users_app, name="users")
     target.command("send")(_send_handler)
+    target.command("dm")(_dm_handler)
     target.command("streams")(_streams_handler)
     target.command("topics")(_topics_handler)
     target.command("read")(_read_handler)
@@ -2711,10 +3212,11 @@ def _register_commands(target: typer.Typer) -> None:
 _register_commands(app)
 @
 
-The output needs to stay readable for both a whole stream and a single
-topic.
-We therefore print a UTC timestamp, sender, and topic on the first
-line.
+The header needs to stay readable for both stream history and direct
+messages.
+We therefore print a UTC timestamp and sender on the first line, plus a
+third column that is either the stream topic or the DM conversation's
+participant set.
 For the message body we keep Zulip's raw Markdown when stdout is not a
 TTY, so pipes and redirections receive exactly the source text.
 Interactive terminals can do better, and [[rich]] is now a required
@@ -2744,14 +3246,30 @@ def _print_read_content(content):
 @
 
 <<functions>>=
+def _read_message_target(message):
+    """Return the topic or DM participant label for one message."""
+    if message.get("type") == "private":
+        recipients = message.get("display_recipient")
+        if isinstance(recipients, list):
+            return ", ".join(
+                recipient["full_name"]
+                for recipient in sorted(
+                    recipients,
+                    key=lambda recipient: recipient["full_name"],
+                )
+            )
+    return message.get("topic") or message.get("subject", "")
+@
+
+<<functions>>=
 def _print_read_message(message):
     """Print one message in the read command format."""
     timestamp = datetime.fromtimestamp(
         message["timestamp"],
         timezone.utc,
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    topic = message.get("topic") or message.get("subject", "")
-    print(f"{timestamp}\t{message['sender_full_name']}\t{topic}")
+    target = _read_message_target(message)
+    print(f"{timestamp}\t{message['sender_full_name']}\t{target}")
     _print_read_content(message["content"])
     print()
 @
@@ -2762,27 +3280,23 @@ to one past the last message ID we have already seen.
 If the caller asked to mark messages as read, we defer that update until
 after every page has been printed successfully.
 
+That loop does not care whether the narrow points at a stream or a DM
+conversation, so [[read]] and [[dm]] share one helper that accepts the
+already-constructed narrow.
+
 <<functions>>=
-def read_command(client, args):
-    """Read messages from a stream or topic."""
+def _read_messages(client, narrow, *, mark_as_read):
+    """Read all messages matching ``narrow`` from oldest to newest."""
     request = {
         "anchor": 0,
         "num_before": 0,
         "num_after": HISTORY_BATCH_SIZE,
-        "narrow": [{"operator": "stream", "operand": args.stream}],
+        "narrow": list(narrow),
         "client_gravatar": False,
         "apply_markdown": False,
     }
-    if args.topic:
-        request["narrow"].append(
-            {"operator": "topic", "operand": args.topic}
-        )
-    if args.unread:
-        request["narrow"].append(
-            {"operator": "is", "operand": "unread"}
-        )
 
-    printed_message_ids = [] if args.mark_as_read else None
+    printed_message_ids = [] if mark_as_read else None
     found_newest = False
     while not found_newest:
         result = _require_success(client.get_messages(request))
@@ -2801,6 +3315,21 @@ def read_command(client, args):
             "op": "add",
             "flag": "read",
         }))
+@
+
+<<functions>>=
+def read_command(client, args):
+    """Read messages from a stream or topic."""
+    narrow = [{"operator": "stream", "operand": args.stream}]
+    if args.topic:
+        narrow.append(
+            {"operator": "topic", "operand": args.topic}
+        )
+    if args.unread:
+        narrow.append(
+            {"operator": "is", "operand": "unread"}
+        )
+    _read_messages(client, narrow, mark_as_read=args.mark_as_read)
 @
 
 Let's verify that the CLI forwards the new filtering and acknowledgement
@@ -2871,6 +3400,7 @@ def _make_stream_message(message_id, timestamp, sender, topic, content):
         "id": message_id,
         "timestamp": timestamp,
         "sender_full_name": sender,
+        "type": "stream",
         "topic": topic,
         "content": content,
     }
