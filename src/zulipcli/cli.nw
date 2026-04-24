@@ -312,7 +312,7 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
     if client is None:
         return []
 
-    result = client.get_members()
+    result = client.get_users()
     if result.get("result") != "success":
         return []
 
@@ -616,9 +616,22 @@ _INVITE_ROLE_LABELS = {
 
 \subsection{Listing users: \texttt{users list}}
 
-The Zulip API's [[get_members]] returns every user with fields like
-[[full_name]], [[email]], [[delivery_email]], [[user_id]],
+The Zulip API's [[get_users]] method returns every user with fields
+like [[full_name]], [[email]], [[delivery_email]], [[user_id]],
 [[is_bot]], and [[is_active]].
+The library also exposes a [[get_members]] alias that simply forwards
+to [[get_users]]; it is kept around for backwards compatibility, and
+its docstring already warns that a deprecation warning may be added
+later.
+We call the canonical [[get_users]] so the code keeps working when
+that warning lands.
+
+The response shape still uses [[members]] as its top-level key,
+because the server's JSON format predates the client-side rename and
+cannot change without breaking every existing client.
+That is why the rest of this file reads [[result["members"]]] even
+though the call is [[get_users]].
+
 The [[email]] field is the address Zulip uses for API routing
 (often [[user42@subdomain.zulipchat.com]] when the realm hides real
 addresses), whereas [[delivery_email]] is the mailbox an operator
@@ -679,7 +692,7 @@ their real mailbox.
 <<functions>>=
 def users_list_command(client, args):
     """List users, optionally filtered by pattern."""
-    result = _require_success(client.get_members())
+    result = _require_success(client.get_users())
 
     if args.pattern:
         pattern = re.compile(args.pattern, re.IGNORECASE)
@@ -765,7 +778,7 @@ def _make_members():
 <<test functions>>=
 def test_users_list_excludes_bots_by_default(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern=None,
         include_bots=False,
@@ -780,7 +793,7 @@ def test_users_list_excludes_bots_by_default(capsys):
 <<test functions>>=
 def test_users_list_excludes_deactivated_by_default(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern=None,
         include_bots=False,
@@ -795,7 +808,7 @@ def test_users_list_excludes_deactivated_by_default(capsys):
 <<test functions>>=
 def test_users_list_pattern_filters_by_name(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern="diana",
         include_bots=False,
@@ -810,7 +823,7 @@ def test_users_list_pattern_filters_by_name(capsys):
 <<test functions>>=
 def test_users_list_pattern_filters_by_email(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern="alice@",
         include_bots=False,
@@ -829,7 +842,7 @@ email contains the substring [[corp]].
 <<test functions>>=
 def test_users_list_pattern_filters_by_delivery_email(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern="alice.admin@corp",
         include_bots=False,
@@ -848,7 +861,7 @@ email.
 <<test functions>>=
 def test_users_list_prints_three_column_output(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern="alice",
         include_bots=False,
@@ -864,7 +877,7 @@ def test_users_list_prints_three_column_output(capsys):
 <<test functions>>=
 def test_users_list_delivery_email_column_empty_when_hidden(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern="diana",
         include_bots=False,
@@ -882,7 +895,7 @@ def test_users_list_delivery_email_column_empty_when_hidden(capsys):
 <<test functions>>=
 def test_users_list_include_bots(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     args = SimpleNamespace(
         pattern=None,
         include_bots=True,
@@ -1494,7 +1507,7 @@ command has no flag equivalent to [[users list --include-bots]].
 <<functions>>=
 def _resolve_direct_recipients(client, pattern_str):
     """Return active non-bot members whose fields match the regex."""
-    result = _require_success(client.get_members())
+    result = _require_success(client.get_users())
     pattern = re.compile(pattern_str, re.IGNORECASE)
     matches = []
     for member in sorted(result["members"],
@@ -1622,7 +1635,7 @@ The test doubles as a regression test for exact-email regexes.
 <<test functions>>=
 def test_send_direct_message_single_match_sends_without_prompt():
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     client.send_message.return_value = {"result": "success"}
 
     send_command(
@@ -1657,7 +1670,7 @@ def test_send_direct_message_multi_match_fans_out_with_yes():
         "is_active": True,
     })
     client = MagicMock()
-    client.get_members.return_value = members
+    client.get_users.return_value = members
     client.send_message.return_value = {"result": "success"}
 
     send_command(
@@ -1685,7 +1698,7 @@ sends to the matched user's Zulip email.
 <<test functions>>=
 def test_send_direct_message_matches_by_delivery_email():
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     client.send_message.return_value = {"result": "success"}
 
     send_command(
@@ -1713,7 +1726,7 @@ would reject anyway, but less clearly).
 <<test functions>>=
 def test_send_direct_message_errors_when_no_match(capsys):
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
 
     with pytest.raises(SystemExit) as excinfo:
         send_command(
@@ -1739,7 +1752,7 @@ reaches only the active humans.
 <<test functions>>=
 def test_send_direct_message_excludes_bots_and_deactivated():
     client = MagicMock()
-    client.get_members.return_value = _make_members()
+    client.get_users.return_value = _make_members()
     recipients = cli._resolve_direct_recipients(client, ".*")
     emails = [m["email"] for m in recipients]
     assert emails == ["alice@example.com", "diana@example.com"]
@@ -1763,7 +1776,7 @@ def test_send_direct_message_refuses_multi_match_on_pipe(
         "is_active": True,
     })
     client = MagicMock()
-    client.get_members.return_value = members
+    client.get_users.return_value = members
     client.send_message.return_value = {"result": "success"}
     monkeypatch.setattr(cli.sys, "stdin", io.StringIO(""))
 
@@ -1801,7 +1814,7 @@ def test_send_direct_message_declining_prompt_aborts(
         "is_active": True,
     })
     client = MagicMock()
-    client.get_members.return_value = members
+    client.get_users.return_value = members
     client.send_message.return_value = {"result": "success"}
     monkeypatch.setattr(
         cli.sys.stdin,
@@ -2727,7 +2740,7 @@ def test_topic_completion_silently_ignores_missing_stream(monkeypatch):
 <<test functions>>=
 def test_user_completion_returns_email_with_full_name(monkeypatch):
     client = MagicMock()
-    client.get_members.return_value = {
+    client.get_users.return_value = {
         "result": "success",
         "members": [
             {
