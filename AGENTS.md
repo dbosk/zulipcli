@@ -60,8 +60,12 @@ The console script is defined in `pyproject.toml`:
 The CLI is implemented with Typer and Rich in `src/zulipcli/cli.nw`.
 Current user-facing commands are:
 
-- `users`
-- `send`
+- `users list`: list users, filterable by name/Zulip email/delivery email.
+- `users invited`: list pending (unaccepted) invitations (admin-only).
+- `users invite`: invite one or more users by email (admin-only).
+- `send`: send a stream message or a direct message; `--to` is a regex
+  matched against name/Zulip email/delivery email, fans out to all
+  matches, prompts on >1 match unless `--yes` is given.
 - `streams`
 - `topics`
 - `read`

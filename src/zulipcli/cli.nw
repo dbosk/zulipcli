@@ -10,10 +10,15 @@ Similarly, there is no command to list the available streams (channels),
 inspect the topics inside a stream, or read a stream's history from the
 terminal.
 
-The [[zulipcli]] command fills these gaps with five subcommands:
+The [[zulipcli]] command fills these gaps.
+User administration---listing, inviting, and inspecting---is grouped
+under a single [[users]] command family, while the remaining verbs
+stay flat because each speaks to a different Zulip concept:
 \begin{description}
-\item[users] List users, optionally filtered by a name or email
-  pattern.
+\item[users list] List users on the server, optionally filtered by a
+  regex matched against name, Zulip email, and real (delivery) email.
+\item[users invited] List pending (unaccepted) invitations.
+\item[users invite] Invite one or more new users by email.
 \item[send] Send a message to a stream or directly to a user.
 \item[streams] List available streams.
 \item[topics] List the topics inside a stream.
@@ -34,6 +39,7 @@ option names, and argument values.
 
 import configparser
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 import re
 import sys
@@ -290,8 +296,14 @@ def complete_topic_names(ctx: typer.Context, incomplete: str):
 Direct-message completion should return the email address that Zulip
 expects, but humans recognise colleagues by name more easily than by
 address.
-We therefore return the email as the value and the full name as the help
-text for shells that can display it.
+We therefore return the Zulip email as the value and the full name as
+the help text for shells that can display it.
+The matcher checks all three fields shown by [[users list]]---full
+name, Zulip email, and delivery (real) email---so typing the prefix
+of any of them surfaces the same candidate.
+The \emph{value} stays the Zulip email because that is what Zulip's
+send-message API expects; [[delivery_email]] is a read-only
+convenience.
 
 <<functions>>=
 def complete_user_emails(ctx: typer.Context, incomplete: str):
@@ -314,8 +326,10 @@ def complete_user_emails(ctx: typer.Context, incomplete: str):
 
         email = member["email"]
         full_name = member["full_name"]
+        delivery_email = member.get("delivery_email") or ""
         if not (
             _matches_completion(email, incomplete)
+            or _matches_completion(delivery_email, incomplete)
             or _matches_completion(full_name, incomplete)
         ):
             continue
@@ -344,6 +358,7 @@ from unittest.mock import MagicMock
 import zulipcli.cli as cli
 from zulipcli.cli import (
     HISTORY_BATCH_SIZE,
+    InviteRole,
     app,
     complete_stream_names,
     complete_topic_names,
@@ -352,7 +367,9 @@ from zulipcli.cli import (
     send_command,
     streams_command,
     topics_command,
-    users_command,
+    users_invite_command,
+    users_invited_command,
+    users_list_command,
 )
 
 runner = CliRunner()
@@ -402,7 +419,7 @@ def test_cli_reports_missing_zuliprc_without_traceback(monkeypatch):
 
     result = runner.invoke(
         app,
-        ["--zuliprc", "/tmp/missing.zuliprc", "users"],
+        ["--zuliprc", "/tmp/missing.zuliprc", "users", "list"],
     )
 
     assert result.exit_code == 1
@@ -548,26 +565,88 @@ def test_stream_completion_silently_ignores_lookup_errors(monkeypatch):
 @
 
 
-\section{The \texttt{users} subcommand}
+\section{The \texttt{users} subcommand group}
 \label{sec:users}
 
-This is the primary motivation for the tool.
-The Zulip API method [[get_members]] returns a list of all users on the
-server, each with fields like [[full_name]], [[email]], [[user_id]],
-[[is_bot]], and [[is_active]].
+User administration is the primary motivation for this tool, and a
+typical workflow chains three related questions: who is on the
+server, who has been invited but not yet joined, and how do I invite
+someone new?
+Grouping those verbs under a single [[users]] command family keeps
+the top-level namespace tidy and makes the relationship obvious from
+the help output.
+The three flat verbs that follow ([[send]], [[streams]], [[topics]],
+[[read]]) each speak to a different Zulip concept and do not gain
+anything from further nesting.
 
-We output users as tab-separated lines (name, email) so the output is
-easy to pipe through standard Unix tools like [[grep]], [[cut]], and
-[[sort]].
-By default we exclude bots and deactivated users, since the common use
-case is finding a human colleague's email address.
+We declare the group up-front so each per-verb handler below can
+attach itself via [[@users_app.command(...)]] as it is introduced.
+Setting [[no_args_is_help=True]] makes [[zulipcli users]] print the
+subcommand list rather than failing silently---useful both for
+discovery and as a migration signal for anyone still typing the flat
+[[zulipcli users PATTERN]] form that this tool used to accept.
 
 <<functions>>=
-def _users_handler(
+users_app = typer.Typer(
+    help="List, invite, and inspect users on the server.",
+    no_args_is_help=True,
+)
+@
+
+Zulip's invitation API identifies roles by integer codes, and the
+same codes come back when we list pending invitations.
+Defining the label$\leftrightarrow$code mapping once, next to the
+commands that consume it, means the rest of the code never has to
+touch the raw integers---and the two tables stay in sync because the
+reverse lookup is derived from the forward one.
+
+<<constants>>=
+_INVITE_ROLE_CODES = {
+    "owner": 100,
+    "admin": 200,
+    "moderator": 300,
+    "member": 400,
+    "guest": 600,
+}
+_INVITE_ROLE_LABELS = {
+    code: label for label, code in _INVITE_ROLE_CODES.items()
+}
+@
+
+
+\subsection{Listing users: \texttt{users list}}
+
+The Zulip API's [[get_members]] returns every user with fields like
+[[full_name]], [[email]], [[delivery_email]], [[user_id]],
+[[is_bot]], and [[is_active]].
+The [[email]] field is the address Zulip uses for API routing
+(often [[user42@subdomain.zulipchat.com]] when the realm hides real
+addresses), whereas [[delivery_email]] is the mailbox an operator
+actually wants to reach.
+When the caller is an organisation admin and the realm's policy
+permits it, [[delivery_email]] carries the user's real email;
+otherwise Zulip returns [[None]].
+
+Showing both columns lets scripts correlate a Zulip identity with a
+real inbox in one shot, which is the whole reason this command
+exists.
+We print tab-separated lines so [[grep]], [[cut]], and [[sort]]
+continue to work, and we print an empty field when Zulip withheld
+[[delivery_email]]---that keeps the column count stable for
+[[cut -f3]] consumers.
+By default we exclude bots and deactivated users because the typical
+question is \enquote{who, on my team, can I reach right now?}.
+
+<<functions>>=
+@users_app.command("list")
+def _users_list_handler(
     ctx: typer.Context,
     pattern: Annotated[
         Optional[str],
-        typer.Argument(help="filter users by name or email (regex)"),
+        typer.Argument(
+            help="filter users by name, email, or delivery "
+                 "email (regex)",
+        ),
     ] = None,
     include_bots: Annotated[
         bool,
@@ -579,7 +658,7 @@ def _users_handler(
     ] = False,
 ):
     """List users on the Zulip server."""
-    users_command(
+    users_list_command(
         _get_client_from_context(ctx),
         SimpleNamespace(
             pattern=pattern,
@@ -589,15 +668,16 @@ def _users_handler(
     )
 @
 
-The implementation fetches all members, applies the filters, and prints
-each matching user.
-We compile the pattern once (if given) and match it case-insensitively
-against both the full name and the email address, so that
-[[zulipcli users bosk]] finds both \enquote{Daniel Bosk} and
-\enquote{dbosk@example.com}.
+The implementation fetches all members, applies the filters, and
+prints each matching user.
+We compile the pattern once (if given) and match it
+case-insensitively against the full name, Zulip email, and delivery
+email, so [[zulipcli users list bosk]] finds the user whether
+\enquote{bosk} appears in their display name, their Zulip handle, or
+their real mailbox.
 
 <<functions>>=
-def users_command(client, args):
+def users_list_command(client, args):
     """List users, optionally filtered by pattern."""
     result = _require_success(client.get_members())
 
@@ -609,12 +689,18 @@ def users_command(client, args):
     for member in sorted(result["members"],
                          key=lambda m: m["full_name"]):
         <<skip filtered users>>
-        print(f"{member['full_name']}\t{member['email']}")
+        delivery = member.get("delivery_email") or ""
+        print(
+            f"{member['full_name']}\t{member['email']}\t{delivery}"
+        )
 @
 
 We skip users that don't match the active filters.
-The order matters: we check the cheapest conditions first (boolean
-flags) before the more expensive regex match.
+Order matters: cheap boolean checks first, then the regex.
+The pattern search ORs three haystacks so a match in any column
+passes; when [[delivery_email]] is absent or empty we simply exclude
+it from the haystack list rather than trying to match an empty
+string.
 
 <<skip filtered users>>=
 if not args.include_bots and member.get("is_bot", False):
@@ -622,15 +708,21 @@ if not args.include_bots and member.get("is_bot", False):
 if not args.include_deactivated \
         and not member.get("is_active", True):
     continue
-if pattern and not (pattern.search(member["full_name"])
-                    or pattern.search(member["email"])):
-    continue
+if pattern:
+    haystacks = [
+        member["full_name"],
+        member["email"],
+        member.get("delivery_email") or "",
+    ]
+    if not any(pattern.search(field) for field in haystacks if field):
+        continue
 @
 
-Let's verify that the filtering logic works correctly.
-We create mock API responses and check that bots and deactivated users
-are excluded by default, and that the pattern filter matches against
-both name and email fields.
+Let's build a small fixture that the three verbs share.
+It includes one user whose delivery email differs from the Zulip
+email, two whose delivery email is empty (the common case when the
+caller is not an admin), and the usual bot and deactivated rows that
+exercise the default filters.
 
 <<test functions>>=
 def _make_members():
@@ -641,24 +733,28 @@ def _make_members():
             {
                 "full_name": "Alice Admin",
                 "email": "alice@example.com",
+                "delivery_email": "alice.admin@corp.example",
                 "is_bot": False,
                 "is_active": True,
             },
             {
                 "full_name": "Bob Bot",
                 "email": "bob-bot@example.com",
+                "delivery_email": None,
                 "is_bot": True,
                 "is_active": True,
             },
             {
                 "full_name": "Charlie Inactive",
                 "email": "charlie@example.com",
+                "delivery_email": "",
                 "is_bot": False,
                 "is_active": False,
             },
             {
                 "full_name": "Diana Developer",
                 "email": "diana@example.com",
+                "delivery_email": "",
                 "is_bot": False,
                 "is_active": True,
             },
@@ -667,7 +763,7 @@ def _make_members():
 @
 
 <<test functions>>=
-def test_users_excludes_bots_by_default(capsys):
+def test_users_list_excludes_bots_by_default(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
     args = SimpleNamespace(
@@ -675,14 +771,14 @@ def test_users_excludes_bots_by_default(capsys):
         include_bots=False,
         include_deactivated=False,
     )
-    users_command(client, args)
+    users_list_command(client, args)
     output = capsys.readouterr().out
     assert "Alice Admin" in output
     assert "Bob Bot" not in output
 @
 
 <<test functions>>=
-def test_users_excludes_deactivated_by_default(capsys):
+def test_users_list_excludes_deactivated_by_default(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
     args = SimpleNamespace(
@@ -690,14 +786,14 @@ def test_users_excludes_deactivated_by_default(capsys):
         include_bots=False,
         include_deactivated=False,
     )
-    users_command(client, args)
+    users_list_command(client, args)
     output = capsys.readouterr().out
     assert "Alice Admin" in output
     assert "Charlie Inactive" not in output
 @
 
 <<test functions>>=
-def test_users_pattern_filters_by_name(capsys):
+def test_users_list_pattern_filters_by_name(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
     args = SimpleNamespace(
@@ -705,14 +801,14 @@ def test_users_pattern_filters_by_name(capsys):
         include_bots=False,
         include_deactivated=False,
     )
-    users_command(client, args)
+    users_list_command(client, args)
     output = capsys.readouterr().out
     assert "Diana Developer" in output
     assert "Alice Admin" not in output
 @
 
 <<test functions>>=
-def test_users_pattern_filters_by_email(capsys):
+def test_users_list_pattern_filters_by_email(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
     args = SimpleNamespace(
@@ -720,14 +816,71 @@ def test_users_pattern_filters_by_email(capsys):
         include_bots=False,
         include_deactivated=False,
     )
-    users_command(client, args)
+    users_list_command(client, args)
     output = capsys.readouterr().out
     assert "Alice Admin" in output
     assert "Diana Developer" not in output
 @
 
+The delivery-email filter is the interesting new case: Alice matches
+only through [[delivery_email]], since neither her name nor her Zulip
+email contains the substring [[corp]].
+
 <<test functions>>=
-def test_users_include_bots(capsys):
+def test_users_list_pattern_filters_by_delivery_email(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = SimpleNamespace(
+        pattern="alice.admin@corp",
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_list_command(client, args)
+    output = capsys.readouterr().out
+    assert "Alice Admin" in output
+    assert "Diana Developer" not in output
+@
+
+We also verify the stable three-column output so scripts relying on
+[[cut -f3]] do not have to special-case rows with a hidden delivery
+email.
+
+<<test functions>>=
+def test_users_list_prints_three_column_output(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = SimpleNamespace(
+        pattern="alice",
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_list_command(client, args)
+    lines = capsys.readouterr().out.strip().split("\n")
+    assert lines == [
+        "Alice Admin\talice@example.com\talice.admin@corp.example",
+    ]
+@
+
+<<test functions>>=
+def test_users_list_delivery_email_column_empty_when_hidden(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    args = SimpleNamespace(
+        pattern="diana",
+        include_bots=False,
+        include_deactivated=False,
+    )
+    users_list_command(client, args)
+    line = capsys.readouterr().out.rstrip("\n")
+    assert line.split("\t") == [
+        "Diana Developer",
+        "diana@example.com",
+        "",
+    ]
+@
+
+<<test functions>>=
+def test_users_list_include_bots(capsys):
     client = MagicMock()
     client.get_members.return_value = _make_members()
     args = SimpleNamespace(
@@ -735,9 +888,447 @@ def test_users_include_bots(capsys):
         include_bots=True,
         include_deactivated=False,
     )
-    users_command(client, args)
+    users_list_command(client, args)
     output = capsys.readouterr().out
     assert "Bob Bot" in output
+@
+
+
+\subsection{Listing pending invitations: \texttt{users invited}}
+
+Pending invitations are the mirror image of [[users list]]: email
+addresses that have received an invitation link but not yet redeemed
+it.
+The [[zulip]] Python library exposes no dedicated invitation method,
+so we reach for the escape hatch that the library itself uses
+internally when a helper is missing:
+[[client.call_endpoint(url="invites", method="GET")]].
+
+The API requires organisation-administrator privileges, so a
+non-admin caller will see [[Error: Must be an organization
+administrator]] on stderr rather than a traceback; that path reuses
+our existing [[_require_success]] helper unchanged.
+
+Each invitation record carries an [[email]], an [[expiry_date]]
+(Unix seconds, or [[None]] for never-expiring links), an
+[[invited_as]] role code, and an [[invited_by_user_id]].
+We format each row as four tab-separated columns, translate the
+expiry to ISO-8601 UTC, and map the role code back to its label so
+scripts never have to memorise Zulip's integers.
+An empty invitation list prints nothing, matching the silent
+\enquote{no results} convention already used by [[users list]].
+
+<<functions>>=
+@users_app.command("invited")
+def _users_invited_handler(
+    ctx: typer.Context,
+    pattern: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="filter invitations by invitee email (regex)",
+        ),
+    ] = None,
+):
+    """List pending (unaccepted) invitations."""
+    users_invited_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(pattern=pattern),
+    )
+@
+
+<<functions>>=
+def users_invited_command(client, args):
+    """List pending invitations, optionally filtered by email."""
+    result = _require_success(client.call_endpoint(
+        url="invites",
+        method="GET",
+    ))
+
+    if args.pattern:
+        pattern = re.compile(args.pattern, re.IGNORECASE)
+    else:
+        pattern = None
+
+    for invite in sorted(result.get("invites", []),
+                         key=lambda inv: inv["email"]):
+        if pattern and not pattern.search(invite["email"]):
+            continue
+        print(_format_invitation_row(invite))
+@
+
+Expiry formatting has two shapes to handle.
+[[None]] represents a never-expiring invitation and prints the empty
+string so downstream [[cut -f]] callers still see four fields; an
+integer is a Unix timestamp and renders as UTC ISO-8601 to match the
+format already produced by the [[read]] command.
+
+<<functions>>=
+def _format_invitation_row(invite):
+    """Format one invitation as a tab-separated row."""
+    expiry = invite.get("expiry_date")
+    if expiry is None:
+        expiry_iso = ""
+    else:
+        expiry_iso = datetime.fromtimestamp(
+            expiry,
+            tz=timezone.utc,
+        ).isoformat(timespec="seconds")
+    role_code = invite.get("invited_as")
+    role_label = _INVITE_ROLE_LABELS.get(role_code, str(role_code))
+    inviter = invite.get("invited_by_user_id", "")
+    return f"{invite['email']}\t{expiry_iso}\t{role_label}\t{inviter}"
+@
+
+Let's verify the success path with two rows: one dated, one that
+never expires.
+We sort by email so the assertion is stable even if Zulip's server
+order ever changes.
+
+<<test functions>>=
+def test_users_invited_lists_pending(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invites": [
+            {
+                "email": "newcomer@example.com",
+                "expiry_date": 0,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+            {
+                "email": "forever@example.com",
+                "expiry_date": None,
+                "invited_as": 600,
+                "invited_by_user_id": 5,
+            },
+        ],
+    }
+    users_invited_command(
+        client,
+        SimpleNamespace(pattern=None),
+    )
+    output = capsys.readouterr().out.strip().split("\n")
+    assert output == [
+        "forever@example.com\t\tguest\t5",
+        "newcomer@example.com\t1970-01-01T00:00:00+00:00\tmember\t5",
+    ]
+    client.call_endpoint.assert_called_once_with(
+        url="invites",
+        method="GET",
+    )
+@
+
+<<test functions>>=
+def test_users_invited_filters_by_email(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invites": [
+            {
+                "email": "keep@example.com",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+            {
+                "email": "drop@example.com",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+            },
+        ],
+    }
+    users_invited_command(
+        client,
+        SimpleNamespace(pattern="keep"),
+    )
+    output = capsys.readouterr().out
+    assert "keep@example.com" in output
+    assert "drop@example.com" not in output
+@
+
+<<test functions>>=
+def test_users_invited_prints_nothing_when_empty(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invites": [],
+    }
+    users_invited_command(
+        client,
+        SimpleNamespace(pattern=None),
+    )
+    assert capsys.readouterr().out == ""
+@
+
+Non-admin callers get a descriptive error from the server; we surface
+it verbatim so the caller understands why the command failed.
+
+<<test functions>>=
+def test_users_invited_reports_permission_error(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "error",
+        "msg": "Must be an organization administrator",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_invited_command(
+            client,
+            SimpleNamespace(pattern=None),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Must be an organization administrator\n"
+    )
+@
+
+
+\subsection{Inviting users: \texttt{users invite}}
+
+Creating an invitation is a [[POST]] to the same [[invites]]
+endpoint.
+The API requires at least one invitee email; the rest---role,
+expiration, and pre-subscribed streams---have server-side defaults
+that most callers accept.
+We expose the full option set from day one so an operator onboarding
+a cohort can set role and starting streams in a single call rather
+than accepting a default and editing it afterwards through the web
+UI.
+
+Role is exposed as a string label rather than the raw integer code,
+both because the labels are easier to remember and because Typer
+turns an [[Enum]] subclass into shell-completion choices
+automatically---no custom completion helper needed.
+
+<<functions>>=
+class InviteRole(str, Enum):
+    """Labels for Zulip's numeric organisation-role codes."""
+
+    owner = "owner"
+    admin = "admin"
+    moderator = "moderator"
+    member = "member"
+    guest = "guest"
+@
+
+The option name [[--as]] reads naturally (\enquote{invite Alice as
+admin}) but [[as]] is a Python keyword, so the parameter name has to
+be [[invite_as]] and the CLI alias is wired explicitly.
+
+The [[EMAIL...]] positional argument has no autocompletion because
+the target addresses are, by construction, not yet users of the
+server; completing from the member list would be actively
+misleading.
+
+<<functions>>=
+@users_app.command("invite")
+def _users_invite_handler(
+    ctx: typer.Context,
+    emails: Annotated[
+        list[str],
+        typer.Argument(
+            help="email addresses to invite",
+        ),
+    ],
+    invite_as: Annotated[
+        InviteRole,
+        typer.Option(
+            "--as",
+            "-a",
+            help="organisation role assigned to invitees",
+        ),
+    ] = InviteRole.member,
+    expires_in: Annotated[
+        Optional[int],
+        typer.Option(
+            "--expires-in",
+            help="invitation expiry in minutes "
+                 "(default: server policy)",
+        ),
+    ] = None,
+    streams: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--stream",
+            "-s",
+            help="stream to subscribe invitees to (repeatable)",
+            autocompletion=complete_stream_names,
+        ),
+    ] = None,
+):
+    """Invite one or more users to the Zulip organisation."""
+    users_invite_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            emails=emails,
+            invite_as=invite_as,
+            expires_in=expires_in,
+            streams=list(streams or []),
+        ),
+    )
+@
+
+Stream subscriptions require numeric IDs, not names, so we resolve
+each requested stream before building the request.
+Resolving up-front means an unknown stream name aborts with a clear
+[[Error: Invalid channel name ...]] \emph{before} any invitation is
+sent, rather than after a partial success.
+
+The [[invitee_emails]] field accepts both comma-separated and
+newline-separated strings; we prefer newlines because commas inside
+display names or anti-spam quoting would otherwise have to be
+escaped manually.
+
+Omitting [[invite_expires_in_minutes]] and [[stream_ids]] from the
+request when the user did not ask for them lets the server apply its
+own defaults rather than forcing an empty list to mean
+\enquote{subscribe to nothing}.
+
+<<functions>>=
+def users_invite_command(client, args):
+    """Create invitations for the given emails."""
+    stream_ids = [
+        _require_success(client.get_stream_id(name))["stream_id"]
+        for name in args.streams
+    ]
+
+    request = {
+        "invitee_emails": "\n".join(args.emails),
+        "invite_as": _INVITE_ROLE_CODES[args.invite_as.value],
+    }
+    if args.expires_in is not None:
+        request["invite_expires_in_minutes"] = args.expires_in
+    if stream_ids:
+        request["stream_ids"] = stream_ids
+
+    _require_success(client.call_endpoint(
+        url="invites",
+        method="POST",
+        request=request,
+    ))
+@
+
+Let's verify the minimal happy path: a single invitee, default role,
+no streams, no explicit expiry.
+
+<<test functions>>=
+def test_users_invite_sends_minimal_request():
+    client = MagicMock()
+    client.call_endpoint.return_value = {"result": "success"}
+
+    users_invite_command(
+        client,
+        SimpleNamespace(
+            emails=["new@example.com"],
+            invite_as=InviteRole.member,
+            expires_in=None,
+            streams=[],
+        ),
+    )
+
+    client.call_endpoint.assert_called_once_with(
+        url="invites",
+        method="POST",
+        request={
+            "invitee_emails": "new@example.com",
+            "invite_as": 400,
+        },
+    )
+    client.get_stream_id.assert_not_called()
+@
+
+A batch call with role, expiry, and several streams should resolve
+each stream name in order and encode the streams as a
+[[stream_ids]] list.
+
+<<test functions>>=
+def test_users_invite_resolves_streams_and_role():
+    client = MagicMock()
+    client.get_stream_id.side_effect = [
+        {"result": "success", "stream_id": 7},
+        {"result": "success", "stream_id": 11},
+    ]
+    client.call_endpoint.return_value = {"result": "success"}
+
+    users_invite_command(
+        client,
+        SimpleNamespace(
+            emails=["one@example.com", "two@example.com"],
+            invite_as=InviteRole.admin,
+            expires_in=1440,
+            streams=["general", "random"],
+        ),
+    )
+
+    client.call_endpoint.assert_called_once_with(
+        url="invites",
+        method="POST",
+        request={
+            "invitee_emails": "one@example.com\ntwo@example.com",
+            "invite_as": 200,
+            "invite_expires_in_minutes": 1440,
+            "stream_ids": [7, 11],
+        },
+    )
+@
+
+An unknown stream aborts before the invitation is posted.
+
+<<test functions>>=
+def test_users_invite_reports_unknown_stream(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "error",
+        "msg": "Invalid channel name 'missing'",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_invite_command(
+            client,
+            SimpleNamespace(
+                emails=["one@example.com"],
+                invite_as=InviteRole.member,
+                expires_in=None,
+                streams=["missing"],
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid channel name 'missing'\n"
+    )
+    client.call_endpoint.assert_not_called()
+@
+
+Permission-denied errors from the invitation endpoint surface the
+same way the listing command does.
+
+<<test functions>>=
+def test_users_invite_reports_permission_error(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "error",
+        "msg": "Must be an organization administrator",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_invite_command(
+            client,
+            SimpleNamespace(
+                emails=["one@example.com"],
+                invite_as=InviteRole.member,
+                expires_in=None,
+                streams=[],
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Must be an organization administrator\n"
+    )
 @
 
 
@@ -751,6 +1342,17 @@ We accept the message body either as a positional argument or from
 standard input.
 Reading from stdin is useful for piping output from other commands
 directly into a Zulip message, which is a common scripting pattern.
+
+The [[--to]] value is a regex matched against every active non-bot
+user's full name, Zulip email, and delivery email; all matches
+receive the message.
+This turns \enquote{DM everyone in the Alice team} into a one-liner
+instead of forcing the caller to copy--paste addresses, and makes a
+single-address send work the same way (any valid email is itself a
+regex that happens to match exactly one user).
+Because a loose pattern can reach more people than intended, a
+multi-match send pauses for confirmation on an interactive terminal
+and requires [[--yes]] on a pipe.
 
 <<functions>>=
 def _send_handler(
@@ -776,10 +1378,21 @@ def _send_handler(
     to: Annotated[
         Optional[str],
         typer.Option(
-            help="recipient email for direct messages",
+            help="direct-message recipient: regex matched against "
+                 "full name, Zulip email, and delivery email "
+                 "(all matches receive the message)",
             autocompletion=complete_user_emails,
         ),
     ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="skip confirmation when --to matches "
+                 "multiple users",
+        ),
+    ] = False,
     message: Annotated[
         Optional[str],
         typer.Argument(help="message content (reads stdin if omitted)"),
@@ -792,6 +1405,7 @@ def _send_handler(
             stream=stream,
             topic=topic,
             to=to,
+            yes=yes,
             message=message,
         ),
     )
@@ -805,7 +1419,7 @@ user provides neither or both.
 
 <<functions>>=
 def send_command(client, args):
-    """Send a message to a stream or directly to a user."""
+    """Send a message to a stream or directly to one or more users."""
     content = args.message
     if content is None:
         content = sys.stdin.read()
@@ -838,16 +1452,92 @@ _require_success(client.send_message(request))
 
 Direct messages use the [[direct]] type (called [[private]] in older
 API versions).
-The [[to]] field accepts a list of email addresses; we support a
-single recipient for simplicity.
+The [[to]] field on the wire accepts a list of Zulip emails; our
+resolver turns the caller's regex into that list and asks for
+confirmation when more than one user is about to be messaged.
+A match on [[delivery_email]] still sends to the matched user's Zulip
+[[email]], because the API expects the registered address rather than
+the user's mailbox.
 
 <<send direct message>>=
+recipients = _resolve_direct_recipients(client, args.to)
+if not recipients:
+    _exit_with_error(
+        f"--to pattern {args.to!r} matched no active users"
+    )
+if len(recipients) > 1 and not _confirm_recipients(
+    recipients,
+    assume_yes=args.yes,
+):
+    _exit_with_error("aborted by user")
+
 request = {
     "type": "direct",
-    "to": [args.to],
+    "to": [member["email"] for member in recipients],
     "content": content,
 }
 _require_success(client.send_message(request))
+@
+
+We factor the resolution into its own helper for two reasons.
+First, the regex semantics already drive the help text of [[--to]]
+and the completion helper, and collecting the logic in one place
+keeps all three aligned.
+Second, tests for the fan-out behaviour can then drive this helper
+directly without having to fake a message body or a confirmation
+prompt.
+
+Bots and deactivated accounts are excluded unconditionally; sending a
+DM to a bot or a disabled user is almost always a mistake and the
+command has no flag equivalent to [[users list --include-bots]].
+
+<<functions>>=
+def _resolve_direct_recipients(client, pattern_str):
+    """Return active non-bot members whose fields match the regex."""
+    result = _require_success(client.get_members())
+    pattern = re.compile(pattern_str, re.IGNORECASE)
+    matches = []
+    for member in sorted(result["members"],
+                         key=lambda m: m["full_name"]):
+        if member.get("is_bot", False):
+            continue
+        if not member.get("is_active", True):
+            continue
+        haystacks = [
+            member["full_name"],
+            member["email"],
+            member.get("delivery_email") or "",
+        ]
+        if any(pattern.search(field) for field in haystacks if field):
+            matches.append(member)
+    return matches
+@
+
+The confirmation helper prints the matched recipients to stderr so
+the preview does not pollute stdout (which scripts may be capturing),
+then asks on stdin.
+A non-interactive stdin without [[--yes]] refuses rather than silently
+confirming: fan-out on a pipe is exactly the case where an accidental
+broadcast is most expensive to undo.
+
+<<functions>>=
+def _confirm_recipients(members, *, assume_yes):
+    """Confirm sending a DM to multiple recipients."""
+    for member in members:
+        print(
+            f"{member['full_name']}\t{member['email']}",
+            file=sys.stderr,
+        )
+    if assume_yes:
+        return True
+    stdin_is_tty = getattr(sys.stdin, "isatty", None)
+    if not stdin_is_tty or not stdin_is_tty():
+        _exit_with_error(
+            f"--to matched {len(members)} recipients; "
+            "pass --yes to send without confirmation"
+        )
+    answer = input(f"Send to {len(members)} users? [y/N] ")
+    return answer.strip().lower() in {"y", "yes"}
 @
 
 Let's verify the error cases that the Typer wrappers still delegate to:
@@ -866,6 +1556,7 @@ def test_send_reads_message_from_stdin(monkeypatch):
             stream="general",
             topic="Announcements",
             to=None,
+            yes=False,
             message=None,
         ),
     )
@@ -888,6 +1579,7 @@ def test_send_rejects_mixed_stream_and_direct_targets(capsys):
                 stream="general",
                 topic="Announcements",
                 to="alice@example.com",
+                yes=False,
                 message="Hello",
             ),
         )
@@ -910,6 +1602,7 @@ def test_send_requires_topic_for_stream_messages(capsys):
                 stream="general",
                 topic=None,
                 to=None,
+                yes=False,
                 message="Hello",
             ),
         )
@@ -921,9 +1614,15 @@ def test_send_requires_topic_for_stream_messages(capsys):
     client.send_message.assert_not_called()
 @
 
+A single-user match keeps the behaviour that older callers relied on:
+typing a literal email address sends to exactly that user with no
+prompt.
+The test doubles as a regression test for exact-email regexes.
+
 <<test functions>>=
-def test_send_direct_message_uses_email_list():
+def test_send_direct_message_single_match_sends_without_prompt():
     client = MagicMock()
+    client.get_members.return_value = _make_members()
     client.send_message.return_value = {"result": "success"}
 
     send_command(
@@ -932,6 +1631,7 @@ def test_send_direct_message_uses_email_list():
             stream=None,
             topic=None,
             to="alice@example.com",
+            yes=False,
             message="Hello directly",
         ),
     )
@@ -941,6 +1641,191 @@ def test_send_direct_message_uses_email_list():
         "to": ["alice@example.com"],
         "content": "Hello directly",
     })
+@
+
+A partial-name regex should fan out to every match, but only after
+[[--yes]] bypasses the confirmation prompt.
+
+<<test functions>>=
+def test_send_direct_message_multi_match_fans_out_with_yes():
+    members = _make_members()
+    members["members"].append({
+        "full_name": "Alice Alternate",
+        "email": "alice2@example.com",
+        "delivery_email": "alice.alternate@corp.example",
+        "is_bot": False,
+        "is_active": True,
+    })
+    client = MagicMock()
+    client.get_members.return_value = members
+    client.send_message.return_value = {"result": "success"}
+
+    send_command(
+        client,
+        SimpleNamespace(
+            stream=None,
+            topic=None,
+            to="Alice",
+            yes=True,
+            message="Hi Alices",
+        ),
+    )
+
+    client.send_message.assert_called_once_with({
+        "type": "direct",
+        "to": ["alice@example.com", "alice2@example.com"],
+        "content": "Hi Alices",
+    })
+@
+
+Matching by delivery email is the key new behaviour: the user types
+something their counterpart knows from their real inbox, and the CLI
+sends to the matched user's Zulip email.
+
+<<test functions>>=
+def test_send_direct_message_matches_by_delivery_email():
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    client.send_message.return_value = {"result": "success"}
+
+    send_command(
+        client,
+        SimpleNamespace(
+            stream=None,
+            topic=None,
+            to="alice.admin@corp",
+            yes=False,
+            message="Hi via real email",
+        ),
+    )
+
+    client.send_message.assert_called_once_with({
+        "type": "direct",
+        "to": ["alice@example.com"],
+        "content": "Hi via real email",
+    })
+@
+
+When no active human matches the pattern, we abort with a descriptive
+error rather than sending to an empty recipient list (which Zulip
+would reject anyway, but less clearly).
+
+<<test functions>>=
+def test_send_direct_message_errors_when_no_match(capsys):
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+
+    with pytest.raises(SystemExit) as excinfo:
+        send_command(
+            client,
+            SimpleNamespace(
+                stream=None,
+                topic=None,
+                to="nobody",
+                yes=False,
+                message="Hi",
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert "matched no active users" in capsys.readouterr().err
+    client.send_message.assert_not_called()
+@
+
+Bots and deactivated users are excluded from the match set even when
+the regex would hit them, so [[--to '.*']] on a default fixture
+reaches only the active humans.
+
+<<test functions>>=
+def test_send_direct_message_excludes_bots_and_deactivated():
+    client = MagicMock()
+    client.get_members.return_value = _make_members()
+    recipients = cli._resolve_direct_recipients(client, ".*")
+    emails = [m["email"] for m in recipients]
+    assert emails == ["alice@example.com", "diana@example.com"]
+@
+
+A multi-match send on a pipe (non-TTY stdin) without [[--yes]] must
+refuse rather than silently broadcasting.
+We fake [[sys.stdin.isatty]] to return [[False]] to simulate a pipe.
+
+<<test functions>>=
+def test_send_direct_message_refuses_multi_match_on_pipe(
+    capsys,
+    monkeypatch,
+):
+    members = _make_members()
+    members["members"].append({
+        "full_name": "Alice Alternate",
+        "email": "alice2@example.com",
+        "delivery_email": "",
+        "is_bot": False,
+        "is_active": True,
+    })
+    client = MagicMock()
+    client.get_members.return_value = members
+    client.send_message.return_value = {"result": "success"}
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(SystemExit) as excinfo:
+        send_command(
+            client,
+            SimpleNamespace(
+                stream=None,
+                topic=None,
+                to="Alice",
+                yes=False,
+                message="Hi",
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "pass --yes" in err
+    client.send_message.assert_not_called()
+@
+
+Declining the interactive prompt must also abort without sending.
+
+<<test functions>>=
+def test_send_direct_message_declining_prompt_aborts(
+    capsys,
+    monkeypatch,
+):
+    members = _make_members()
+    members["members"].append({
+        "full_name": "Alice Alternate",
+        "email": "alice2@example.com",
+        "delivery_email": "",
+        "is_bot": False,
+        "is_active": True,
+    })
+    client = MagicMock()
+    client.get_members.return_value = members
+    client.send_message.return_value = {"result": "success"}
+    monkeypatch.setattr(
+        cli.sys.stdin,
+        "isatty",
+        lambda: True,
+        raising=False,
+    )
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        send_command(
+            client,
+            SimpleNamespace(
+                stream=None,
+                topic=None,
+                to="Alice",
+                yes=False,
+                message="Hi",
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert "aborted by user" in capsys.readouterr().err
+    client.send_message.assert_not_called()
 @
 
 <<test functions>>=
@@ -1244,16 +2129,18 @@ def _read_handler(
     )
 @
 
-The standalone and embedded applications must expose the same five
-subcommands.
+The standalone and embedded applications must expose the same command
+surface.
 We therefore register the handlers through one helper that binds the
-shared command implementations to whichever [[typer.Typer]] instance we
-are constructing.
+shared command implementations to whichever [[typer.Typer]] instance
+we are constructing.
+The [[users]] group is attached with [[add_typer]] so its three
+subcommands ride along; the remaining verbs stay flat.
 
 <<functions>>=
 def _register_commands(target: typer.Typer) -> None:
     """Register Zulip subcommands on ``target``."""
-    target.command("users")(_users_handler)
+    target.add_typer(users_app, name="users")
     target.command("send")(_send_handler)
     target.command("streams")(_streams_handler)
     target.command("topics")(_topics_handler)
