@@ -3120,9 +3120,12 @@ def test_dm_unread_selected_conversation_marks_after_printing(
 
 The [[read]] command reads the complete history of a stream or one
 topic within a stream.
-Zulip's [[get_messages()]] API already accepts stream and topic names in
-its [[narrow]] parameter, so the command can expose those names
-directly.
+When the caller omits the stream entirely, we fall back to an otherwise
+empty narrow and let Zulip interpret that as all messages this user can
+see.
+That makes the bare [[zulipcli read -U]] form useful for cron jobs and
+other inbox sweeps, while keeping the more specific stream/topic form for
+interactive inspection.
 
 To read a whole history rather than one page, we follow Zulip's own
 [[get-history]] example: start at anchor [[0]], which means the oldest
@@ -3148,12 +3151,12 @@ HISTORY_BATCH_SIZE = 1000
 def _read_handler(
     ctx: typer.Context,
     stream: Annotated[
-        str,
+        Optional[str],
         typer.Argument(
-            help="stream (channel) name",
+            help="stream (channel) name; omit to read all visible messages",
             autocompletion=complete_stream_names,
         ),
-    ],
+    ] = None,
     topic: Annotated[
         Optional[str],
         typer.Argument(
@@ -3320,8 +3323,12 @@ def _read_messages(client, narrow, *, mark_as_read):
 <<functions>>=
 def read_command(client, args):
     """Read messages from a stream or topic."""
-    narrow = [{"operator": "stream", "operand": args.stream}]
-    if args.topic:
+    narrow = []
+    if args.stream:
+        narrow.append(
+            {"operator": "stream", "operand": args.stream}
+        )
+    if args.topic and args.stream:
         narrow.append(
             {"operator": "topic", "operand": args.topic}
         )
@@ -3391,6 +3398,34 @@ def test_read_cli_defaults_to_all_messages_without_marking(monkeypatch):
     assert seen["args"].mark_as_read is False
 @
 
+The stream argument is now optional, so a bare [[read -U]] should route to
+[[read_command()]] with no stream narrow at all.
+
+<<test functions>>=
+def test_read_cli_allows_omitted_stream(monkeypatch):
+    seen = {}
+
+    def fake_read_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "read_command", fake_read_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, ["read", "-U"])
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].stream is None
+    assert seen["args"].topic is None
+    assert seen["args"].unread is True
+    assert seen["args"].mark_as_read is False
+@
+
 Let's build a small helper for synthetic history payloads.
 
 <<test functions>>=
@@ -3457,6 +3492,48 @@ def test_read_stream_uses_stream_name(capsys, monkeypatch):
         "Hello stream\n\n"
     )
     client.update_message_flags.assert_not_called()
+@
+
+The streamless form should generate no stream narrow term at all; unread
+filtering remains just another narrow clause layered on top.
+
+<<test functions>>=
+def test_read_without_stream_uses_only_requested_unread_filter(
+    monkeypatch,
+):
+    response = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [],
+    }
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return response
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    args = SimpleNamespace(
+        stream=None,
+        topic=None,
+        unread=True,
+        mark_as_read=False,
+    )
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    read_command(client, args)
+
+    assert requests == [{
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": [
+            {"operator": "is", "operand": "unread"},
+        ],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }]
 @
 
 We should also verify that interactive terminals render Markdown through
