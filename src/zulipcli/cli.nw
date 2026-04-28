@@ -42,6 +42,8 @@ option names, and argument values.
 import configparser
 from datetime import datetime, timezone
 from enum import Enum
+import io
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -373,6 +375,7 @@ subcommands without claiming that root option for itself.
 
 import copy
 import io
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -3220,6 +3223,12 @@ remaining arguments through untouched.
 That keeps worker flags available without forcing this command to know
 anything about them.
 
+The worker also needs the unread messages themselves.
+Some workers are easiest to drive with the plain text that [[read]]
+already prints, while others want a machine-readable format.
+We therefore expose a small enum for the worker's stdin format: the
+default [[read]] format and an optional [[json]] payload.
+
 <<constants>>=
 BOT_CONTEXT_SETTINGS = {
     "allow_extra_args": True,
@@ -3236,14 +3245,31 @@ BOT_MAX_RETRY_SECONDS = 60 * 60
 @
 
 <<functions>>=
-def _bot_handler(ctx: typer.Context):
+class BotStdinFormat(str, Enum):
+    """Formats available for bot worker stdin."""
+
+    read = "read"
+    json = "json"
+@
+
+<<functions>>=
+def _bot_handler(
+    ctx: typer.Context,
+    stdin_format: Annotated[
+        BotStdinFormat,
+        typer.Option(
+            "--stdin-format",
+            help="format for unread messages written to worker stdin",
+        ),
+    ] = BotStdinFormat.read,
+):
     """Run a worker whenever unread messages are pending."""
     command = list(ctx.args)
     if not command:
         _exit_with_error("bot requires a worker command")
     bot_command(
         _get_client_from_context(ctx),
-        SimpleNamespace(command=command),
+        SimpleNamespace(command=command, stdin_format=stdin_format),
     )
 @
 
@@ -3273,6 +3299,36 @@ def test_bot_cli_passes_worker_command(monkeypatch):
     assert result.exit_code == 0
     assert seen["client"] == "client"
     assert seen["args"].command == ["worker", "--flag", "value"]
+    assert seen["args"].stdin_format == cli.BotStdinFormat.read
+@
+
+The enum-backed stdin-format option should also reach [[bot_command()]]
+as the selected enum value.
+
+<<test functions>>=
+def test_bot_cli_passes_stdin_format(monkeypatch):
+    seen = {}
+
+    def fake_bot_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "bot_command", fake_bot_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(
+        app,
+        ["bot", "--stdin-format", "json", "--", "worker"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].command == ["worker"]
+    assert seen["args"].stdin_format == cli.BotStdinFormat.json
 @
 
 Without a worker command, the bot has nothing useful to do.
@@ -3391,6 +3447,29 @@ def _register_bot_queue(client):
     return result["queue_id"], result["last_event_id"], pending_unread_ids
 @
 
+The queue tells us whether unread work exists, but the worker needs the
+current messages themselves.
+Fetching a fresh visible-unread snapshot immediately before launch keeps
+the worker's stdin aligned with reality: if every queued message was
+already consumed or deleted, we can skip the spawn entirely.
+
+<<functions>>=
+def _bot_messages_to_stdin(messages, stdin_format):
+    """Return the worker stdin payload for ``messages``."""
+    if stdin_format == BotStdinFormat.json:
+        return json.dumps(messages)
+    buffer = io.StringIO()
+    for message in messages:
+        _write_read_message(buffer, message)
+    return buffer.getvalue()
+@
+
+<<functions>>=
+def _get_bot_worker_messages(client):
+    """Return visible unread messages for the next bot worker run."""
+    return _get_all_visible_unread_messages(client)
+@
+
 Let's verify that truncated snapshots really do trigger the exact unread
 scan, rather than leaving the bot to reason from an incomplete set.
 
@@ -3486,9 +3565,21 @@ Message events add unread IDs when Zulip says the message is still
 unread, flag updates add or remove IDs as the read state changes, and a
 restart event tells us to throw away local assumptions and resynchronize
 from a fresh register snapshot.
+When the caller wants to acknowledge a worker's input batch after a
+successful run, it also helps to know whether Zulip reported any of
+those messages as deleted while the worker was busy.
+An explicit mark-unread event is just as important: it is newer than the
+stdin snapshot, so the bot must preserve that unread state instead of
+forcing the message back to read.
 
 <<functions>>=
-def _apply_bot_event(pending_unread_ids, event):
+def _apply_bot_event(
+    pending_unread_ids,
+    event,
+    *,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
+):
     """Apply one event to the bot's unread state.
 
     Return [[True]] when the caller should resynchronize from register.
@@ -3508,10 +3599,16 @@ def _apply_bot_event(pending_unread_ids, event):
                     event.get("messages", [])
                 )
         elif op == "remove":
-            pending_unread_ids.update(event.get("messages", []))
+            unread_ids = event.get("messages", [])
+            pending_unread_ids.update(unread_ids)
+            if restored_unread_ids is not None:
+                restored_unread_ids.update(unread_ids)
         return False
     if event_type == "delete_message":
-        pending_unread_ids.difference_update(_deleted_message_ids(event))
+        deleted_ids = _deleted_message_ids(event)
+        pending_unread_ids.difference_update(deleted_ids)
+        if deleted_message_ids is not None:
+            deleted_message_ids.update(deleted_ids)
         return False
     return event_type == "restart"
 @
@@ -3521,13 +3618,24 @@ whole Zulip response and ask only whether that batch forced a full
 resynchronization.
 
 <<functions>>=
-def _apply_bot_events(pending_unread_ids, events):
+def _apply_bot_events(
+    pending_unread_ids,
+    events,
+    *,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
+):
     """Apply a batch of bot events.
 
     Return [[True]] when the caller should resynchronize from register.
     """
     for event in events:
-        if _apply_bot_event(pending_unread_ids, event):
+        if _apply_bot_event(
+            pending_unread_ids,
+            event,
+            deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
+        ):
             return True
     return False
 @
@@ -3564,7 +3672,15 @@ Non-blocking reads let us empty that backlog completely before deciding
 whether another worker run is actually necessary.
 
 <<functions>>=
-def _drain_bot_events(client, queue_id, last_event_id, pending_unread_ids):
+def _drain_bot_events(
+    client,
+    queue_id,
+    last_event_id,
+    pending_unread_ids,
+    *,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
+):
     """Drain all currently queued bot events.
 
     Return the new [[last_event_id]] and whether the queue must be
@@ -3577,7 +3693,12 @@ def _drain_bot_events(client, queue_id, last_event_id, pending_unread_ids):
             last_event_id,
             dont_block=True,
         )
-        if needs_resync or _apply_bot_events(pending_unread_ids, events):
+        if needs_resync or _apply_bot_events(
+            pending_unread_ids,
+            events,
+            deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
+        ):
             return last_event_id, True
         if not events:
             return last_event_id, False
@@ -3596,6 +3717,8 @@ def _refresh_bot_queue(
     pending_unread_ids,
     *,
     dont_block,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
 ):
     """Apply queued events, recreating the queue when needed."""
     if dont_block:
@@ -3604,6 +3727,8 @@ def _refresh_bot_queue(
             queue_id,
             last_event_id,
             pending_unread_ids,
+            deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
         )
     else:
         events, last_event_id, needs_resync = _get_bot_events(
@@ -3612,7 +3737,12 @@ def _refresh_bot_queue(
             last_event_id,
         )
         if not needs_resync:
-            needs_resync = _apply_bot_events(pending_unread_ids, events)
+            needs_resync = _apply_bot_events(
+                pending_unread_ids,
+                events,
+                deleted_message_ids=deleted_message_ids,
+                restored_unread_ids=restored_unread_ids,
+            )
     if needs_resync:
         return _register_bot_queue(client)
     return queue_id, last_event_id, pending_unread_ids
@@ -3652,10 +3782,10 @@ an immediate, actionable message instead of leaving the bot in a useless
 retry loop.
 
 <<functions>>=
-def _run_bot_worker(command):
+def _run_bot_worker(command, stdin_payload):
     """Run the configured worker command."""
     try:
-        return subprocess.run(command)
+        return subprocess.run(command, input=stdin_payload, text=True)
     except OSError as error:
         _exit_with_error(
             f"could not start worker command {command[0]!r}: {error}"
@@ -3682,6 +3812,13 @@ drain the queue to reconcile everything that happened during that run,
 and only then decide whether another run is still justified.
 Non-zero worker exits keep the bot alive, but only after the requested
 backoff and only while unread work still remains.
+
+Right before each launch, we replace the queue-derived unread-ID set with
+the current visible unread messages and serialize those messages for the
+worker's stdin.
+That extra fetch costs one more request per run, but it avoids spawning a
+worker for unread IDs that already vanished and makes the worker's input
+precise.
 
 <<functions>>=
 def bot_command(client, args):
@@ -3730,13 +3867,32 @@ Worker execution itself is synchronous.
 That is deliberate: one active worker is enough, because the queue lets
 us merge every event that arrived while it was busy into one follow-up
 decision.
+We keep track of messages that were deleted or explicitly restored to
+unread during that run, because those newer queue events override the
+original stdin snapshot when we decide what can be acknowledged.
 
 <<run the worker once>>=
-worker_result = _run_bot_worker(args.command)
+messages = _get_bot_worker_messages(client)
+pending_unread_ids = {message["id"] for message in messages}
+if not pending_unread_ids:
+    failed_runs = 0
+    continue
+deleted_message_ids = set()
+restored_unread_ids = set()
+worker_result = _run_bot_worker(
+    args.command,
+    _bot_messages_to_stdin(messages, args.stdin_format),
+)
 @
 
 Draining the queue immediately after the worker run is what prevents a
 stale message event from forcing a second, empty worker invocation.
+If the worker succeeded, we also treat its stdin batch as acknowledged
+work.
+The worker may already have marked those messages as read itself, so we
+first drain the queue and only acknowledge the subset of that batch that
+was neither deleted nor explicitly marked unread while the worker was
+busy.
 If the worker succeeded, or if no unread work remains after the drain, we
 reset the failure counter and return to the top of the loop.
 
@@ -3747,7 +3903,18 @@ queue_id, last_event_id, pending_unread_ids = _refresh_bot_queue(
     last_event_id,
     pending_unread_ids,
     dont_block=True,
+    deleted_message_ids=deleted_message_ids,
+    restored_unread_ids=restored_unread_ids,
 )
+if worker_result.returncode == 0:
+    message_ids_to_mark = [
+        message["id"]
+        for message in messages
+        if message["id"] not in deleted_message_ids
+        and message["id"] not in restored_unread_ids
+    ]
+    _mark_message_ids_as_read(client, message_ids_to_mark)
+    pending_unread_ids.difference_update(message_ids_to_mark)
 if worker_result.returncode == 0 or not pending_unread_ids:
     failed_runs = 0
     continue
@@ -3842,9 +4009,57 @@ def _make_bot_delete_event(event_id, *, message_id=None, message_ids=None):
     return event
 @
 
+<<test functions>>=
+def _make_bot_worker_message(message_id, *, content=None):
+    """Create a sample unread message for bot worker stdin tests."""
+    if content is None:
+        content = f"Message {message_id}"
+    return _make_stream_message(
+        message_id,
+        60 * message_id,
+        f"Sender {message_id}",
+        f"Topic {message_id}",
+        content,
+    )
+@
+
+The plain stdin payload should exactly reuse the non-interactive
+[[read]] formatting so a worker can consume the same text a human would
+see on a pipe.
+
+<<test functions>>=
+def test_bot_messages_to_stdin_uses_read_format():
+    payload = cli._bot_messages_to_stdin(
+        [_make_bot_worker_message(1)],
+        cli.BotStdinFormat.read,
+    )
+
+    assert payload == (
+        "1970-01-01T00:01:00Z\tSender 1\tTopic 1\n"
+        "Message 1\n\n"
+    )
+@
+
+JSON mode should preserve the full message objects instead of collapsing
+them into plain text.
+
+<<test functions>>=
+def test_bot_messages_to_stdin_uses_json_format():
+    messages = [_make_bot_worker_message(1)]
+
+    assert json.loads(cli._bot_messages_to_stdin(
+        messages,
+        cli.BotStdinFormat.json,
+    )) == messages
+@
+
 Starting the bot with unread work already pending should launch the
 worker immediately, but draining a subsequent read-flag event must clear
 that work instead of causing an empty second run.
+The extra empty queue batch keeps the test alive long enough to exercise
+the acknowledgement path after the drain.
+That acknowledgement may still issue the idempotent mark-read request for
+the worker's original batch, but it must not trigger a rerun.
 
 <<test functions>>=
 def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
@@ -3870,21 +4085,161 @@ def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
             "result": "success",
             "events": [_make_bot_flag_event(1, [1])],
         },
+        {
+            "result": "success",
+            "events": [],
+        },
         KeyboardInterrupt,
     ]
     runs = []
+    messages = [_make_bot_worker_message(1)]
+    marked = []
 
-    def run_worker(command):
-        runs.append(list(command))
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: messages,
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    client.update_message_flags.side_effect = update_message_flags
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
+
+    assert runs == [{
+        "command": ["worker"],
+        "input": cli._bot_messages_to_stdin(
+            messages,
+            cli.BotStdinFormat.read,
+        ),
+        "text": True,
+    }]
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+    ]
+    client.deregister.assert_called_once_with("queue-123")
+@
+
+If someone explicitly marks the worker's message unread while the worker
+is busy, that newer queue event must win over the successful worker
+exit.
+The bot should therefore leave that message unread, skip the automatic
+acknowledgement for that ID, and rerun the worker once.
+
+<<test functions>>=
+def test_bot_preserves_messages_marked_unread_during_worker_run(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(1, [1], op="remove")],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(2, [1])],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+    worker_batches = [
+        [_make_bot_worker_message(1)],
+        [_make_bot_worker_message(1)],
+    ]
+    marked = []
+
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: worker_batches.pop(0),
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    client.update_message_flags.side_effect = update_message_flags
 
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 
-    assert runs == [["worker"]]
-    client.deregister.assert_called_once_with("queue-123")
+    assert runs == [
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+    ]
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+    ]
 @
 
 If fresh unread work survives the post-run drain, the bot should launch
@@ -3931,17 +4286,63 @@ def test_bot_reruns_once_when_new_unread_remains_after_drain(monkeypatch):
         KeyboardInterrupt,
     ]
     runs = []
+    worker_batches = [
+        [_make_bot_worker_message(1)],
+        [_make_bot_worker_message(2)],
+    ]
+    marked = []
 
-    def run_worker(command):
-        runs.append(list(command))
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: worker_batches.pop(0),
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
-
+    client.update_message_flags.side_effect = update_message_flags
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 
-    assert runs == [["worker"], ["worker"]]
+    assert runs == [
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(2)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+    ]
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+        {"messages": [2], "op": "add", "flag": "read"},
+    ]
 @
 
 Zulip can deliver a message event that is already marked read for this
@@ -3960,13 +4361,65 @@ def test_bot_ignores_already_read_message_events(monkeypatch):
         KeyboardInterrupt,
     ]
 
-    def run_worker(command):
+    def run_worker(command, *, input, text):
         raise AssertionError("worker should not run")
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
 
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
+    client.update_message_flags.assert_not_called()
+@
+
+The queue can report unread IDs that have already disappeared by the time
+we are ready to launch the worker.
+Refreshing the visible unread snapshot should suppress that pointless
+spawn.
+
+<<test functions>>=
+def test_bot_skips_worker_when_fresh_unread_snapshot_is_empty(monkeypatch):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [KeyboardInterrupt]
+
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: [],
+    )
+
+    def run_worker(command, *, input, text):
+        raise AssertionError("worker should not run")
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 @
 
 Worker failures should trigger the configured backoff only while unread
@@ -4003,24 +4456,70 @@ def test_bot_retries_failed_worker_with_backoff(monkeypatch):
     runs = []
     sleep_delays = []
     return_codes = [1, 0]
+    worker_batches = [
+        [_make_bot_worker_message(1)],
+        [_make_bot_worker_message(1)],
+    ]
+    marked = []
 
-    def run_worker(command):
-        runs.append(list(command))
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: worker_batches.pop(0),
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
         return SimpleNamespace(returncode=return_codes.pop(0))
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
     monkeypatch.setattr(cli.time, "sleep", sleep_delays.append)
+    client.update_message_flags.side_effect = update_message_flags
 
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 
-    assert runs == [["worker"], ["worker"]]
+    assert runs == [
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+    ]
     assert sleep_delays == [60]
+    assert marked == []
 @
 
 Deleting a pending message should clear it from the unread set in the
 same way as marking it read.
 Otherwise the bot could keep retrying for work that no longer exists.
+As in the previous reconciliation test, we keep one extra empty queue
+batch so the success path reaches its acknowledgement decision.
 
 <<test functions>>=
 def test_bot_drops_deleted_messages_from_pending_set(monkeypatch):
@@ -4044,20 +4543,55 @@ def test_bot_drops_deleted_messages_from_pending_set(monkeypatch):
             "result": "success",
             "events": [_make_bot_delete_event(1, message_id=1)],
         },
+        {
+            "result": "success",
+            "events": [],
+        },
         KeyboardInterrupt,
     ]
     runs = []
+    messages = [_make_bot_worker_message(1)]
+    marked = []
 
-    def run_worker(command):
-        runs.append(list(command))
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: messages,
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    client.update_message_flags.side_effect = update_message_flags
 
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 
-    assert runs == [["worker"]]
+    assert runs == [{
+        "command": ["worker"],
+        "input": cli._bot_messages_to_stdin(
+            messages,
+            cli.BotStdinFormat.read,
+        ),
+        "text": True,
+    }]
+    assert marked == []
 @
 
 If the queue expires while the worker is running or sleeping, the bot
@@ -4095,17 +4629,50 @@ def test_bot_resynchronizes_after_bad_event_queue_id(monkeypatch):
         KeyboardInterrupt,
     ]
     runs = []
+    messages = [_make_bot_worker_message(1)]
+    marked = []
 
-    def run_worker(command):
-        runs.append(list(command))
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: messages,
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    client.update_message_flags.side_effect = update_message_flags
 
     with pytest.raises(KeyboardInterrupt):
-        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
 
-    assert runs == [["worker"]]
+    assert runs == [{
+        "command": ["worker"],
+        "input": cli._bot_messages_to_stdin(
+            messages,
+            cli.BotStdinFormat.read,
+        ),
+        "text": True,
+    }]
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+    ]
     assert client.register.call_count == 2
     client.deregister.assert_called_once_with("queue-2")
 @
@@ -4153,6 +4720,14 @@ Separating terminal detection from body rendering keeps
 It also makes the two output modes easy to verify in tests: raw piped
 output and rich rendering on a TTY.
 
+The bot's worker-stdin payload adds one more consumer for the plain text
+form.
+That payload must exactly match the non-interactive [[read]] output, but
+it needs to be written into an in-memory buffer rather than directly to
+stdout.
+We therefore factor the plain formatter into file-oriented helpers and
+keep the Rich/TTY path only for direct terminal printing.
+
 <<functions>>=
 def _stdout_is_tty():
     """Return whether stdout is an interactive terminal."""
@@ -4161,12 +4736,18 @@ def _stdout_is_tty():
 @
 
 <<functions>>=
+def _write_read_content(file, content):
+    """Write raw read-command content to ``file``."""
+    print(content, file=file)
+@
+
+<<functions>>=
 def _print_read_content(content):
     """Print Markdown content for the current stdout."""
     if _stdout_is_tty():
         Console(file=sys.stdout).print(Markdown(content))
     else:
-        print(content)
+        _write_read_content(sys.stdout, content)
 @
 
 <<functions>>=
@@ -4186,16 +4767,35 @@ def _read_message_target(message):
 @
 
 <<functions>>=
-def _print_read_message(message):
-    """Print one message in the read command format."""
+def _write_read_message(file, message):
+    """Write one message in the plain read-command format."""
     timestamp = datetime.fromtimestamp(
         message["timestamp"],
         timezone.utc,
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
     target = _read_message_target(message)
-    print(f"{timestamp}\t{message['sender_full_name']}\t{target}")
-    _print_read_content(message["content"])
-    print()
+    print(
+        f"{timestamp}\t{message['sender_full_name']}\t{target}",
+        file=file,
+    )
+    _write_read_content(file, message["content"])
+    print(file=file)
+@
+
+<<functions>>=
+def _print_read_message(message):
+    """Print one message in the read command format."""
+    if _stdout_is_tty():
+        timestamp = datetime.fromtimestamp(
+            message["timestamp"],
+            timezone.utc,
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        target = _read_message_target(message)
+        print(f"{timestamp}\t{message['sender_full_name']}\t{target}")
+        _print_read_content(message["content"])
+        print()
+    else:
+        _write_read_message(sys.stdout, message)
 @
 
 The request stays constant across pages except for the anchor.
@@ -4214,6 +4814,22 @@ the account's personal history, while the bot now also watches unread
 messages in shared public-channel history.
 To keep the worker-facing [[read -U]] command aligned with the bot's
 trigger condition, we read those two scopes separately and merge them.
+
+Several callers need the same acknowledgement step once a batch of
+messages has been handled successfully.
+Keeping that flag update in one helper ensures [[read]] and [[bot]] both
+add the same [[read]] flag in the same way.
+
+<<functions>>=
+def _mark_message_ids_as_read(client, message_ids):
+    """Mark the given message IDs as read when the batch is non-empty."""
+    if message_ids:
+        _require_success(client.update_message_flags({
+            "messages": list(message_ids),
+            "op": "add",
+            "flag": "read",
+        }))
+@
 
 <<functions>>=
 def _read_messages(client, narrow, *, mark_as_read):
@@ -4240,12 +4856,7 @@ def _read_messages(client, narrow, *, mark_as_read):
                     printed_message_ids.append(message["id"])
             request["anchor"] = result["messages"][-1]["id"] + 1
 
-    if printed_message_ids:
-        _require_success(client.update_message_flags({
-            "messages": printed_message_ids,
-            "op": "add",
-            "flag": "read",
-        }))
+    _mark_message_ids_as_read(client, printed_message_ids)
 @
 
 <<functions>>=
@@ -4258,12 +4869,11 @@ def read_command(client, args):
         )
         for message in messages:
             _print_read_message(message)
-        if args.mark_as_read and messages:
-            _require_success(client.update_message_flags({
-                "messages": [message["id"] for message in messages],
-                "op": "add",
-                "flag": "read",
-            }))
+        if args.mark_as_read:
+            _mark_message_ids_as_read(
+                client,
+                [message["id"] for message in messages],
+            )
         return
 
     narrow = []
