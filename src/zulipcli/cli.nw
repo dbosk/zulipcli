@@ -24,6 +24,7 @@ stay flat because each speaks to a different Zulip concept:
 \item[streams] List available streams.
 \item[topics] List the topics inside a stream.
 \item[read] Read the history of a stream or one topic within it.
+\item[bot] Run a long-lived worker whenever unread messages exist.
 \end{description}
 
 We keep the subcommand pattern familiar from Git and the
@@ -43,7 +44,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 import re
+import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from typing import Annotated, Optional
 
@@ -406,6 +409,7 @@ def test_cli_shows_help_without_command():
     result = runner.invoke(app, [])
     assert result.exit_code == 0
     assert "Commands" in result.output
+    assert "bot" in result.output
     assert "read" in result.output
 @
 
@@ -600,8 +604,8 @@ Grouping those verbs under a single [[users]] command family keeps
 the top-level namespace tidy and makes the relationship obvious from
 the help output.
 The flat verbs that follow ([[send]], [[dm]], [[streams]], [[topics]],
-[[read]]) each speak to a different Zulip concept and do not gain
-anything from further nesting.
+[[read]], [[bot]]) each speak to a different Zulip concept and do not
+gain anything from further nesting.
 
 We declare the group up-front so each per-verb handler below can
 attach itself via [[@users_app.command(...)]] as it is introduced.
@@ -3192,6 +3196,920 @@ def _read_handler(
     )
 @
 
+\section{The \texttt{bot} subcommand}
+
+The old cron-driven pattern reran a helper on a timer and let that
+helper ask Zulip whether anything unread had appeared.
+That is simple, but it wakes an expensive worker even when nothing has
+changed.
+The [[bot]] command keeps one process online instead: it maintains a
+local set of unread message IDs and only launches the worker when that
+set is non-empty.
+
+The local unread set matters because a message event is only evidence
+that the message was new at one point.
+By the time the worker exits, that same message may already have been
+consumed by [[zulipcli read -U --mark-as-read]] or deleted.
+We therefore watch every event that changes unreadness for the current
+account, reconcile them into one set, and decide whether to rerun only
+after draining the queue.
+
+The worker command belongs to some other program, not to [[zulipcli]].
+We therefore configure Click to stop parsing after [[bot]] and pass the
+remaining arguments through untouched.
+That keeps worker flags available without forcing this command to know
+anything about them.
+
+<<constants>>=
+BOT_CONTEXT_SETTINGS = {
+    "allow_extra_args": True,
+    "ignore_unknown_options": True,
+}
+BOT_EVENT_TYPES = [
+    "message",
+    "update_message_flags",
+    "delete_message",
+    "restart",
+]
+BOT_INITIAL_RETRY_SECONDS = 60
+BOT_MAX_RETRY_SECONDS = 60 * 60
+@
+
+<<functions>>=
+def _bot_handler(ctx: typer.Context):
+    """Run a worker whenever unread messages are pending."""
+    command = list(ctx.args)
+    if not command:
+        _exit_with_error("bot requires a worker command")
+    bot_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(command=command),
+    )
+@
+
+Let's verify that the CLI passes the worker command through untouched,
+including flags that belong to the worker rather than to [[zulipcli]].
+
+<<test functions>>=
+def test_bot_cli_passes_worker_command(monkeypatch):
+    seen = {}
+
+    def fake_bot_command(client, args):
+        seen["client"] = client
+        seen["args"] = args
+
+    monkeypatch.setattr(cli, "bot_command", fake_bot_command)
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(
+        app,
+        ["bot", "--", "worker", "--flag", "value"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["client"] == "client"
+    assert seen["args"].command == ["worker", "--flag", "value"]
+@
+
+Without a worker command, the bot has nothing useful to do.
+We should reject that case with the same user-facing error path as the
+other commands.
+
+<<test functions>>=
+def test_bot_cli_requires_worker_command():
+    result = runner.invoke(app, ["bot"])
+
+    assert result.exit_code == 1
+    assert "Error: bot requires a worker command" in result.output
+@
+
+Registering the queue gives us an initial snapshot of unread messages.
+When that snapshot is complete, we can seed the bot's unread set without
+any extra requests.
+
+<<functions>>=
+def _unread_message_ids_from_snapshot(unread_msgs):
+    """Return unread message IDs from a register snapshot."""
+    message_ids = set()
+    for key in ("streams", "pms", "huddles"):
+        for entry in unread_msgs.get(key, []):
+            message_ids.update(entry.get("unread_message_ids", []))
+    return message_ids
+@
+
+The register snapshot is capped at Zulip's most recent unread messages.
+When the server tells us older unread messages are missing, a lower-bound
+snapshot is not good enough: the bot would make rerun decisions on stale
+or incomplete data.
+In that case we page through unread history ourselves.
+One query covers the account's personal history, while another covers
+shared public-channel history.
+Merging those results keeps the bot's fallback aligned with the live
+queue's [[all_public_streams]] scope.
+
+<<functions>>=
+def _get_messages_for_narrow(client, narrow):
+    """Return all messages matching ``narrow`` from oldest to newest."""
+    request = {
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": list(narrow),
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }
+    messages = []
+    found_newest = False
+    while not found_newest:
+        result = _require_success(client.get_messages(request))
+        found_newest = result["found_newest"]
+        if result["messages"]:
+            messages.extend(result["messages"])
+            request["anchor"] = result["messages"][-1]["id"] + 1
+    return messages
+@
+
+Zulip's plain [[is:unread]] search only covers the account's personal
+history.
+Shared public-channel history needs an explicit [[channels public]]
+clause.
+We therefore merge both unread searches, deduplicate by message ID, and
+sort by ID so callers see one oldest-to-newest stream of visible unread
+messages.
+
+<<functions>>=
+def _get_all_visible_unread_messages(client):
+    """Return all visible unread messages from oldest to newest."""
+    messages_by_id = {}
+    for narrow in (
+        [{"operator": "is", "operand": "unread"}],
+        [
+            {"operator": "channels", "operand": "public"},
+            {"operator": "is", "operand": "unread"},
+        ],
+    ):
+        for message in _get_messages_for_narrow(client, narrow):
+            messages_by_id[message["id"]] = message
+    return [
+        messages_by_id[message_id]
+        for message_id in sorted(messages_by_id)
+    ]
+@
+
+<<functions>>=
+def _get_all_unread_message_ids(client):
+    """Return the IDs of all visible unread messages."""
+    return {
+        message["id"]
+        for message in _get_all_visible_unread_messages(client)
+    }
+@
+
+The queue registration helper combines those two pieces: use the cheap
+snapshot when it is complete, and fall back to the exact unread scan
+only when the server reports truncation.
+It also asks Zulip for message events from all public streams, because
+the bot's scope is every message visible to the account, not just
+streams the account is subscribed to.
+
+<<functions>>=
+def _register_bot_queue(client):
+    """Register the bot queue and seed its unread state."""
+    result = _require_success(client.register(
+        event_types=BOT_EVENT_TYPES,
+        all_public_streams=True,
+        client_gravatar=False,
+    ))
+    unread_msgs = result.get("unread_msgs", {})
+    pending_unread_ids = _unread_message_ids_from_snapshot(unread_msgs)
+    if unread_msgs.get("old_unreads_missing", False):
+        pending_unread_ids = _get_all_unread_message_ids(client)
+    return result["queue_id"], result["last_event_id"], pending_unread_ids
+@
+
+Let's verify that truncated snapshots really do trigger the exact unread
+scan, rather than leaving the bot to reason from an incomplete set.
+
+<<test functions>>=
+def test_register_bot_queue_rebuilds_truncated_unreads():
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": True,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    responses = [
+        {
+            "result": "success",
+            "found_newest": True,
+            "messages": [{"id": 1}, {"id": 2}],
+        },
+        {
+            "result": "success",
+            "found_newest": True,
+            "messages": [{"id": 2}, {"id": 3}],
+        },
+    ]
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return responses.pop(0)
+
+    client.get_messages.side_effect = get_messages
+
+    queue_id, last_event_id, pending_unread_ids = cli._register_bot_queue(
+        client
+    )
+
+    assert queue_id == "queue-123"
+    assert last_event_id == 0
+    assert pending_unread_ids == {1, 2, 3}
+    assert requests[0]["narrow"] == [
+        {"operator": "is", "operand": "unread"},
+    ]
+    assert requests[1]["narrow"] == [
+        {"operator": "channels", "operand": "public"},
+        {"operator": "is", "operand": "unread"},
+    ]
+@
+
+The registration request itself should include Zulip's
+[[all_public_streams]] option so the long-lived queue keeps receiving
+message events from public streams that are visible through shared
+history.
+
+<<test functions>>=
+def test_register_bot_queue_requests_all_public_streams():
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result()
+
+    cli._register_bot_queue(client)
+
+    client.register.assert_called_once_with(
+        event_types=cli.BOT_EVENT_TYPES,
+        all_public_streams=True,
+        client_gravatar=False,
+    )
+@
+
+Once the bot is running, Zulip may tell us that a message vanished
+instead of merely changing flags.
+Removing those IDs from the pending set avoids a pointless rerun for a
+message that no longer exists or is no longer visible.
+
+<<functions>>=
+def _deleted_message_ids(event):
+    """Return deleted message IDs from a delete-message event."""
+    if "message_ids" in event:
+        return event["message_ids"]
+    if "message_id" in event:
+        return [event["message_id"]]
+    return []
+@
+
+Unread tracking is just a small state machine over the queue events.
+Message events add unread IDs when Zulip says the message is still
+unread, flag updates add or remove IDs as the read state changes, and a
+restart event tells us to throw away local assumptions and resynchronize
+from a fresh register snapshot.
+
+<<functions>>=
+def _apply_bot_event(pending_unread_ids, event):
+    """Apply one event to the bot's unread state.
+
+    Return [[True]] when the caller should resynchronize from register.
+    """
+    event_type = event["type"]
+    if event_type == "message":
+        if "read" not in event.get("flags", []):
+            pending_unread_ids.add(event["message"]["id"])
+        return False
+    if event_type == "update_message_flags" and event.get("flag") == "read":
+        op = event.get("op", event.get("operation"))
+        if op == "add":
+            if event.get("all"):
+                pending_unread_ids.clear()
+            else:
+                pending_unread_ids.difference_update(
+                    event.get("messages", [])
+                )
+        elif op == "remove":
+            pending_unread_ids.update(event.get("messages", []))
+        return False
+    if event_type == "delete_message":
+        pending_unread_ids.difference_update(_deleted_message_ids(event))
+        return False
+    return event_type == "restart"
+@
+
+Batch application keeps the polling helpers simple: they can hand us a
+whole Zulip response and ask only whether that batch forced a full
+resynchronization.
+
+<<functions>>=
+def _apply_bot_events(pending_unread_ids, events):
+    """Apply a batch of bot events.
+
+    Return [[True]] when the caller should resynchronize from register.
+    """
+    for event in events:
+        if _apply_bot_event(pending_unread_ids, event):
+            return True
+    return False
+@
+
+Queue expiry is a normal condition for long-running workers.
+We therefore treat [[BAD_EVENT_QUEUE_ID]] as a resynchronization signal
+instead of as a fatal error, while still reporting every other Zulip API
+failure through the usual command-line path.
+
+<<functions>>=
+def _get_bot_events(client, queue_id, last_event_id, *, dont_block=False):
+    """Return one batch of bot events.
+
+    The third return value reports whether the queue must be recreated.
+    """
+    result = client.get_events(
+        queue_id=queue_id,
+        last_event_id=last_event_id,
+        dont_block=dont_block,
+    )
+    if result.get("result") == "success":
+        events = result.get("events", [])
+        if events:
+            last_event_id = events[-1]["id"]
+        return events, last_event_id, False
+    if result.get("code") == "BAD_EVENT_QUEUE_ID":
+        return [], last_event_id, True
+    _exit_with_error(result.get("msg", "unknown Zulip API error"))
+@
+
+After a worker run we only care about the backlog already sitting in the
+queue.
+Non-blocking reads let us empty that backlog completely before deciding
+whether another worker run is actually necessary.
+
+<<functions>>=
+def _drain_bot_events(client, queue_id, last_event_id, pending_unread_ids):
+    """Drain all currently queued bot events.
+
+    Return the new [[last_event_id]] and whether the queue must be
+    recreated.
+    """
+    while True:
+        events, last_event_id, needs_resync = _get_bot_events(
+            client,
+            queue_id,
+            last_event_id,
+            dont_block=True,
+        )
+        if needs_resync or _apply_bot_events(pending_unread_ids, events):
+            return last_event_id, True
+        if not events:
+            return last_event_id, False
+@
+
+The main loop has two polling modes: block while idle, but drain without
+blocking after a worker run or a retry sleep.
+This helper hides that difference and recreates the queue whenever the
+existing one can no longer provide a trustworthy stream of events.
+
+<<functions>>=
+def _refresh_bot_queue(
+    client,
+    queue_id,
+    last_event_id,
+    pending_unread_ids,
+    *,
+    dont_block,
+):
+    """Apply queued events, recreating the queue when needed."""
+    if dont_block:
+        last_event_id, needs_resync = _drain_bot_events(
+            client,
+            queue_id,
+            last_event_id,
+            pending_unread_ids,
+        )
+    else:
+        events, last_event_id, needs_resync = _get_bot_events(
+            client,
+            queue_id,
+            last_event_id,
+        )
+        if not needs_resync:
+            needs_resync = _apply_bot_events(pending_unread_ids, events)
+    if needs_resync:
+        return _register_bot_queue(client)
+    return queue_id, last_event_id, pending_unread_ids
+@
+
+The retry schedule should grow quickly enough to avoid hammering a broken
+worker, but still stay bounded so the bot does not appear dead.
+We therefore double the delay from one minute upward and cap it at one
+hour.
+
+<<functions>>=
+def _bot_retry_delay_seconds(failed_runs):
+    """Return the retry delay for consecutive failed worker runs."""
+    return min(
+        BOT_INITIAL_RETRY_SECONDS * 2 ** max(0, failed_runs - 1),
+        BOT_MAX_RETRY_SECONDS,
+    )
+@
+
+Let's verify both the doubling pattern and the one-hour cap.
+
+<<test functions>>=
+def test_bot_retry_delay_doubles_and_caps_at_one_hour():
+    assert cli._bot_retry_delay_seconds(1) == 60
+    assert cli._bot_retry_delay_seconds(2) == 120
+    assert cli._bot_retry_delay_seconds(3) == 240
+    assert cli._bot_retry_delay_seconds(4) == 480
+    assert cli._bot_retry_delay_seconds(6) == 1920
+    assert cli._bot_retry_delay_seconds(7) == 3600
+    assert cli._bot_retry_delay_seconds(8) == 3600
+@
+
+Spawning the worker is the only place where the bot touches the local
+process table.
+Treating startup failures as ordinary command-line errors gives the user
+an immediate, actionable message instead of leaving the bot in a useless
+retry loop.
+
+<<functions>>=
+def _run_bot_worker(command):
+    """Run the configured worker command."""
+    try:
+        return subprocess.run(command)
+    except OSError as error:
+        _exit_with_error(
+            f"could not start worker command {command[0]!r}: {error}"
+        )
+@
+
+Queue deletion is only best-effort.
+If cleanup itself fails, Zulip will still garbage-collect the queue after
+its idle timeout.
+
+<<functions>>=
+def _discard_queue(client, queue_id):
+    """Best-effort deregistration of a bot queue."""
+    if queue_id:
+        try:
+            client.deregister(queue_id)
+        except Exception:
+            pass
+@
+
+The main loop is now straightforward to describe:
+wait until the unread set becomes non-empty, run the worker exactly once,
+drain the queue to reconcile everything that happened during that run,
+and only then decide whether another run is still justified.
+Non-zero worker exits keep the bot alive, but only after the requested
+backoff and only while unread work still remains.
+
+<<functions>>=
+def bot_command(client, args):
+    """Run a worker whenever visible unread messages are pending."""
+    queue_id = None
+    last_event_id = None
+    pending_unread_ids = set()
+    failed_runs = 0
+    try:
+        <<register the initial bot queue>>
+        while True:
+            <<wait for unread work>>
+            <<run the worker once>>
+            <<reconcile unread state after the worker>>
+            <<back off before retrying failed work>>
+    finally:
+        _discard_queue(client, queue_id)
+@
+
+The very first register call seeds both the queue cursor and the unread
+set.
+That means the bot reacts immediately if unread messages already exist
+when it starts.
+
+<<register the initial bot queue>>=
+queue_id, last_event_id, pending_unread_ids = _register_bot_queue(client)
+@
+
+An idle bot blocks in [[get_events()]] until something interesting
+happens.
+That keeps the process quiet while still letting Zulip wake it as soon as
+new unread work appears.
+
+<<wait for unread work>>=
+while not pending_unread_ids:
+    queue_id, last_event_id, pending_unread_ids = _refresh_bot_queue(
+        client,
+        queue_id,
+        last_event_id,
+        pending_unread_ids,
+        dont_block=False,
+    )
+@
+
+Worker execution itself is synchronous.
+That is deliberate: one active worker is enough, because the queue lets
+us merge every event that arrived while it was busy into one follow-up
+decision.
+
+<<run the worker once>>=
+worker_result = _run_bot_worker(args.command)
+@
+
+Draining the queue immediately after the worker run is what prevents a
+stale message event from forcing a second, empty worker invocation.
+If the worker succeeded, or if no unread work remains after the drain, we
+reset the failure counter and return to the top of the loop.
+
+<<reconcile unread state after the worker>>=
+queue_id, last_event_id, pending_unread_ids = _refresh_bot_queue(
+    client,
+    queue_id,
+    last_event_id,
+    pending_unread_ids,
+    dont_block=True,
+)
+if worker_result.returncode == 0 or not pending_unread_ids:
+    failed_runs = 0
+    continue
+@
+
+Retry sleeps can easily outlast the current queue's idle lifetime.
+We therefore resynchronize once the backoff expires before trusting the
+old unread set enough to rerun the worker again.
+
+<<back off before retrying failed work>>=
+failed_runs += 1
+delay_seconds = _bot_retry_delay_seconds(failed_runs)
+print(
+    "Error: worker exited with status "
+    f"{worker_result.returncode}; unread messages remain; "
+    f"retrying in {delay_seconds // 60}m",
+    file=sys.stderr,
+)
+time.sleep(delay_seconds)
+queue_id, last_event_id, pending_unread_ids = _refresh_bot_queue(
+    client,
+    queue_id,
+    last_event_id,
+    pending_unread_ids,
+    dont_block=True,
+)
+if not pending_unread_ids:
+    failed_runs = 0
+@
+
+Let's build a few small queue fixtures for the bot tests.
+
+<<test functions>>=
+def _make_bot_register_result(
+    *,
+    queue_id="queue-123",
+    last_event_id=0,
+    unread_msgs=None,
+):
+    """Create a sample register response for bot tests."""
+    if unread_msgs is None:
+        unread_msgs = {
+            "old_unreads_missing": False,
+            "streams": [],
+            "pms": [],
+            "huddles": [],
+        }
+    return {
+        "result": "success",
+        "queue_id": queue_id,
+        "last_event_id": last_event_id,
+        "unread_msgs": unread_msgs,
+    }
+@
+
+<<test functions>>=
+def _make_bot_message_event(event_id, message_id, *, flags=None):
+    """Create a sample message event for bot tests."""
+    return {
+        "id": event_id,
+        "type": "message",
+        "message": {"id": message_id},
+        "flags": [] if flags is None else list(flags),
+    }
+@
+
+<<test functions>>=
+def _make_bot_flag_event(event_id, messages, *, op="add", all=False):
+    """Create a sample update-message-flags event for bot tests."""
+    return {
+        "id": event_id,
+        "type": "update_message_flags",
+        "flag": "read",
+        "op": op,
+        "messages": list(messages),
+        "all": all,
+    }
+@
+
+<<test functions>>=
+def _make_bot_delete_event(event_id, *, message_id=None, message_ids=None):
+    """Create a sample delete-message event for bot tests."""
+    event = {
+        "id": event_id,
+        "type": "delete_message",
+        "message_type": "private",
+    }
+    if message_ids is not None:
+        event["message_ids"] = list(message_ids)
+    elif message_id is not None:
+        event["message_id"] = message_id
+    return event
+@
+
+Starting the bot with unread work already pending should launch the
+worker immediately, but draining a subsequent read-flag event must clear
+that work instead of causing an empty second run.
+
+<<test functions>>=
+def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(1, [1])],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+
+    def run_worker(command):
+        runs.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+
+    assert runs == [["worker"]]
+    client.deregister.assert_called_once_with("queue-123")
+@
+
+If fresh unread work survives the post-run drain, the bot should launch
+exactly one follow-up run.
+That is the core coalescing behaviour we wanted from the start.
+
+<<test functions>>=
+def test_bot_reruns_once_when_new_unread_remains_after_drain(monkeypatch):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [
+                _make_bot_flag_event(1, [1]),
+                _make_bot_message_event(2, 2),
+            ],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(3, [2])],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+
+    def run_worker(command):
+        runs.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+
+    assert runs == [["worker"], ["worker"]]
+@
+
+Zulip can deliver a message event that is already marked read for this
+account.
+Those events must not wake the worker at all.
+
+<<test functions>>=
+def test_bot_ignores_already_read_message_events(monkeypatch):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result()
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [_make_bot_message_event(1, 10, flags=["read"])],
+        },
+        KeyboardInterrupt,
+    ]
+
+    def run_worker(command):
+        raise AssertionError("worker should not run")
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+@
+
+Worker failures should trigger the configured backoff only while unread
+work still remains.
+Once the worker eventually succeeds and clears that work, the bot should
+return to its idle state.
+
+<<test functions>>=
+def test_bot_retries_failed_worker_with_backoff(monkeypatch):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {"result": "success", "events": []},
+        {"result": "success", "events": []},
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(1, [1])],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+    sleep_delays = []
+    return_codes = [1, 0]
+
+    def run_worker(command):
+        runs.append(list(command))
+        return SimpleNamespace(returncode=return_codes.pop(0))
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    monkeypatch.setattr(cli.time, "sleep", sleep_delays.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+
+    assert runs == [["worker"], ["worker"]]
+    assert sleep_delays == [60]
+@
+
+Deleting a pending message should clear it from the unread set in the
+same way as marking it read.
+Otherwise the bot could keep retrying for work that no longer exists.
+
+<<test functions>>=
+def test_bot_drops_deleted_messages_from_pending_set(monkeypatch):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [_make_bot_delete_event(1, message_id=1)],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+
+    def run_worker(command):
+        runs.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+
+    assert runs == [["worker"]]
+@
+
+If the queue expires while the worker is running or sleeping, the bot
+must not trust its old cursor.
+Re-registering and reseeding from current unread state lets it continue
+without an unnecessary extra worker run.
+
+<<test functions>>=
+def test_bot_resynchronizes_after_bad_event_queue_id(monkeypatch):
+    client = MagicMock()
+    client.register.side_effect = [
+        _make_bot_register_result(
+            queue_id="queue-1",
+            unread_msgs={
+                "old_unreads_missing": False,
+                "streams": [
+                    {
+                        "stream_id": 17,
+                        "topic": "Announcements",
+                        "unread_message_ids": [1],
+                    },
+                ],
+                "pms": [],
+                "huddles": [],
+            },
+        ),
+        _make_bot_register_result(queue_id="queue-2"),
+    ]
+    client.get_events.side_effect = [
+        {
+            "result": "error",
+            "code": "BAD_EVENT_QUEUE_ID",
+            "msg": "Bad event queue ID",
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+
+    def run_worker(command):
+        runs.append(list(command))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(client, SimpleNamespace(command=["worker"]))
+
+    assert runs == [["worker"]]
+    assert client.register.call_count == 2
+    client.deregister.assert_called_once_with("queue-2")
+@
+
 The standalone and embedded applications must expose the same command
 surface.
 We therefore register the handlers through one helper that binds the
@@ -3209,6 +4127,9 @@ def _register_commands(target: typer.Typer) -> None:
     target.command("streams")(_streams_handler)
     target.command("topics")(_topics_handler)
     target.command("read")(_read_handler)
+    target.command("bot", context_settings=BOT_CONTEXT_SETTINGS)(
+        _bot_handler
+    )
 @
 
 <<functions>>=
@@ -3287,6 +4208,13 @@ That loop does not care whether the narrow points at a stream or a DM
 conversation, so [[read]] and [[dm]] share one helper that accepts the
 already-constructed narrow.
 
+The bare [[read -U]] case needs one extra wrinkle.
+Without a stream filter, Zulip's plain [[is:unread]] narrow only covers
+the account's personal history, while the bot now also watches unread
+messages in shared public-channel history.
+To keep the worker-facing [[read -U]] command aligned with the bot's
+trigger condition, we read those two scopes separately and merge them.
+
 <<functions>>=
 def _read_messages(client, narrow, *, mark_as_read):
     """Read all messages matching ``narrow`` from oldest to newest."""
@@ -3323,6 +4251,21 @@ def _read_messages(client, narrow, *, mark_as_read):
 <<functions>>=
 def read_command(client, args):
     """Read messages from a stream or topic."""
+    if args.unread and not args.stream:
+        messages = sorted(
+            _get_all_visible_unread_messages(client),
+            key=lambda message: message["id"],
+        )
+        for message in messages:
+            _print_read_message(message)
+        if args.mark_as_read and messages:
+            _require_success(client.update_message_flags({
+                "messages": [message["id"] for message in messages],
+                "op": "add",
+                "flag": "read",
+            }))
+        return
+
     narrow = []
     if args.stream:
         narrow.append(
@@ -3494,26 +4437,32 @@ def test_read_stream_uses_stream_name(capsys, monkeypatch):
     client.update_message_flags.assert_not_called()
 @
 
-The streamless form should generate no stream narrow term at all; unread
-filtering remains just another narrow clause layered on top.
+The streamless unread form now merges unread messages from personal
+history and shared public-channel history so it matches the bot's notion
+of visible unread work.
 
 <<test functions>>=
-def test_read_without_stream_uses_only_requested_unread_filter(
+def test_read_without_stream_reads_all_visible_unread_messages(
+    capsys,
     monkeypatch,
 ):
-    response = {
-        "result": "success",
-        "found_newest": True,
-        "messages": [],
-    }
-    requests = []
-
-    def get_messages(request):
-        requests.append(copy.deepcopy(request))
-        return response
-
     client = MagicMock()
-    client.get_messages.side_effect = get_messages
+    messages = [
+        _make_stream_message(
+            2,
+            60,
+            "Bob Builder",
+            "Public topic",
+            "From shared history",
+        ),
+        _make_stream_message(
+            1,
+            0,
+            "Alice Admin",
+            "DM-ish topic",
+            "From personal history",
+        ),
+    ]
     args = SimpleNamespace(
         stream=None,
         topic=None,
@@ -3521,19 +4470,85 @@ def test_read_without_stream_uses_only_requested_unread_filter(
         mark_as_read=False,
     )
     monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "_get_all_visible_unread_messages",
+        lambda client: messages,
+    )
 
     read_command(client, args)
 
-    assert requests == [{
-        "anchor": 0,
-        "num_before": 0,
-        "num_after": HISTORY_BATCH_SIZE,
-        "narrow": [
-            {"operator": "is", "operand": "unread"},
-        ],
-        "client_gravatar": False,
-        "apply_markdown": False,
-    }]
+    output = capsys.readouterr().out
+    assert output == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tDM-ish topic\n"
+        "From personal history\n\n"
+        "1970-01-01T00:01:00Z\tBob Builder\tPublic topic\n"
+        "From shared history\n\n"
+    )
+    client.get_messages.assert_not_called()
+    client.update_message_flags.assert_not_called()
+@
+
+When the worker wants [[read -U --mark-as-read]], the merged visible
+unread set should still be marked only after every message has been
+printed successfully.
+
+<<test functions>>=
+def test_read_without_stream_marks_visible_unreads_after_printing(
+    monkeypatch,
+):
+    client = MagicMock()
+    messages = [
+        _make_stream_message(
+            2,
+            60,
+            "Bob Builder",
+            "Public topic",
+            "From shared history",
+        ),
+        _make_stream_message(
+            1,
+            0,
+            "Alice Admin",
+            "DM-ish topic",
+            "From personal history",
+        ),
+    ]
+    events = []
+
+    def print_message(message):
+        events.append(("print", message["id"]))
+
+    def update_message_flags(request):
+        events.append(("mark", copy.deepcopy(request)))
+        return {"result": "success"}
+
+    client.update_message_flags.side_effect = update_message_flags
+    args = SimpleNamespace(
+        stream=None,
+        topic=None,
+        unread=True,
+        mark_as_read=True,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_all_visible_unread_messages",
+        lambda client: messages,
+    )
+    monkeypatch.setattr(cli, "_print_read_message", print_message)
+
+    read_command(client, args)
+
+    assert events == [
+        ("print", 1),
+        ("print", 2),
+        ("mark", {
+            "messages": [1, 2],
+            "op": "add",
+            "flag": "read",
+        }),
+    ]
+    client.get_messages.assert_not_called()
 @
 
 We should also verify that interactive terminals render Markdown through
