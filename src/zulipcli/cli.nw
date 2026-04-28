@@ -3568,9 +3568,18 @@ from a fresh register snapshot.
 When the caller wants to acknowledge a worker's input batch after a
 successful run, it also helps to know whether Zulip reported any of
 those messages as deleted while the worker was busy.
+An explicit mark-unread event is just as important: it is newer than the
+stdin snapshot, so the bot must preserve that unread state instead of
+forcing the message back to read.
 
 <<functions>>=
-def _apply_bot_event(pending_unread_ids, event, *, deleted_message_ids=None):
+def _apply_bot_event(
+    pending_unread_ids,
+    event,
+    *,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
+):
     """Apply one event to the bot's unread state.
 
     Return [[True]] when the caller should resynchronize from register.
@@ -3590,7 +3599,10 @@ def _apply_bot_event(pending_unread_ids, event, *, deleted_message_ids=None):
                     event.get("messages", [])
                 )
         elif op == "remove":
-            pending_unread_ids.update(event.get("messages", []))
+            unread_ids = event.get("messages", [])
+            pending_unread_ids.update(unread_ids)
+            if restored_unread_ids is not None:
+                restored_unread_ids.update(unread_ids)
         return False
     if event_type == "delete_message":
         deleted_ids = _deleted_message_ids(event)
@@ -3606,7 +3618,13 @@ whole Zulip response and ask only whether that batch forced a full
 resynchronization.
 
 <<functions>>=
-def _apply_bot_events(pending_unread_ids, events, *, deleted_message_ids=None):
+def _apply_bot_events(
+    pending_unread_ids,
+    events,
+    *,
+    deleted_message_ids=None,
+    restored_unread_ids=None,
+):
     """Apply a batch of bot events.
 
     Return [[True]] when the caller should resynchronize from register.
@@ -3616,6 +3634,7 @@ def _apply_bot_events(pending_unread_ids, events, *, deleted_message_ids=None):
             pending_unread_ids,
             event,
             deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
         ):
             return True
     return False
@@ -3660,6 +3679,7 @@ def _drain_bot_events(
     pending_unread_ids,
     *,
     deleted_message_ids=None,
+    restored_unread_ids=None,
 ):
     """Drain all currently queued bot events.
 
@@ -3677,6 +3697,7 @@ def _drain_bot_events(
             pending_unread_ids,
             events,
             deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
         ):
             return last_event_id, True
         if not events:
@@ -3697,6 +3718,7 @@ def _refresh_bot_queue(
     *,
     dont_block,
     deleted_message_ids=None,
+    restored_unread_ids=None,
 ):
     """Apply queued events, recreating the queue when needed."""
     if dont_block:
@@ -3706,6 +3728,7 @@ def _refresh_bot_queue(
             last_event_id,
             pending_unread_ids,
             deleted_message_ids=deleted_message_ids,
+            restored_unread_ids=restored_unread_ids,
         )
     else:
         events, last_event_id, needs_resync = _get_bot_events(
@@ -3718,6 +3741,7 @@ def _refresh_bot_queue(
                 pending_unread_ids,
                 events,
                 deleted_message_ids=deleted_message_ids,
+                restored_unread_ids=restored_unread_ids,
             )
     if needs_resync:
         return _register_bot_queue(client)
@@ -3843,6 +3867,9 @@ Worker execution itself is synchronous.
 That is deliberate: one active worker is enough, because the queue lets
 us merge every event that arrived while it was busy into one follow-up
 decision.
+We keep track of messages that were deleted or explicitly restored to
+unread during that run, because those newer queue events override the
+original stdin snapshot when we decide what can be acknowledged.
 
 <<run the worker once>>=
 messages = _get_bot_worker_messages(client)
@@ -3851,6 +3878,7 @@ if not pending_unread_ids:
     failed_runs = 0
     continue
 deleted_message_ids = set()
+restored_unread_ids = set()
 worker_result = _run_bot_worker(
     args.command,
     _bot_messages_to_stdin(messages, args.stdin_format),
@@ -3863,7 +3891,8 @@ If the worker succeeded, we also treat its stdin batch as acknowledged
 work.
 The worker may already have marked those messages as read itself, so we
 first drain the queue and only acknowledge the subset of that batch that
-was not deleted while the worker was busy.
+was neither deleted nor explicitly marked unread while the worker was
+busy.
 If the worker succeeded, or if no unread work remains after the drain, we
 reset the failure counter and return to the top of the loop.
 
@@ -3875,12 +3904,14 @@ queue_id, last_event_id, pending_unread_ids = _refresh_bot_queue(
     pending_unread_ids,
     dont_block=True,
     deleted_message_ids=deleted_message_ids,
+    restored_unread_ids=restored_unread_ids,
 )
 if worker_result.returncode == 0:
     message_ids_to_mark = [
         message["id"]
         for message in messages
         if message["id"] not in deleted_message_ids
+        and message["id"] not in restored_unread_ids
     ]
     _mark_message_ids_as_read(client, message_ids_to_mark)
     pending_unread_ids.difference_update(message_ids_to_mark)
@@ -4025,6 +4056,10 @@ def test_bot_messages_to_stdin_uses_json_format():
 Starting the bot with unread work already pending should launch the
 worker immediately, but draining a subsequent read-flag event must clear
 that work instead of causing an empty second run.
+The extra empty queue batch keeps the test alive long enough to exercise
+the acknowledgement path after the drain.
+That acknowledgement may still issue the idempotent mark-read request for
+the worker's original batch, but it must not trigger a rerun.
 
 <<test functions>>=
 def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
@@ -4049,6 +4084,10 @@ def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
         {
             "result": "success",
             "events": [_make_bot_flag_event(1, [1])],
+        },
+        {
+            "result": "success",
+            "events": [],
         },
         KeyboardInterrupt,
     ]
@@ -4093,8 +4132,114 @@ def test_bot_does_not_rerun_when_read_flag_clears_pending_messages(
         ),
         "text": True,
     }]
-    assert marked == []
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+    ]
     client.deregister.assert_called_once_with("queue-123")
+@
+
+If someone explicitly marks the worker's message unread while the worker
+is busy, that newer queue event must win over the successful worker
+exit.
+The bot should therefore leave that message unread, skip the automatic
+acknowledgement for that ID, and rerun the worker once.
+
+<<test functions>>=
+def test_bot_preserves_messages_marked_unread_during_worker_run(
+    monkeypatch,
+):
+    client = MagicMock()
+    client.register.return_value = _make_bot_register_result(
+        unread_msgs={
+            "old_unreads_missing": False,
+            "streams": [
+                {
+                    "stream_id": 17,
+                    "topic": "Announcements",
+                    "unread_message_ids": [1],
+                },
+            ],
+            "pms": [],
+            "huddles": [],
+        },
+    )
+    client.get_events.side_effect = [
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(1, [1], op="remove")],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        {
+            "result": "success",
+            "events": [_make_bot_flag_event(2, [1])],
+        },
+        {
+            "result": "success",
+            "events": [],
+        },
+        KeyboardInterrupt,
+    ]
+    runs = []
+    worker_batches = [
+        [_make_bot_worker_message(1)],
+        [_make_bot_worker_message(1)],
+    ]
+    marked = []
+
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_worker_messages",
+        lambda client: worker_batches.pop(0),
+    )
+
+    def update_message_flags(request):
+        marked.append(copy.deepcopy(request))
+        return {"result": "success"}
+
+    def run_worker(command, *, input, text):
+        runs.append({
+            "command": list(command),
+            "input": input,
+            "text": text,
+        })
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", run_worker)
+    client.update_message_flags.side_effect = update_message_flags
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.bot_command(
+            client,
+            SimpleNamespace(
+                command=["worker"],
+                stdin_format=cli.BotStdinFormat.read,
+            ),
+        )
+
+    assert runs == [
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+        {
+            "command": ["worker"],
+            "input": cli._bot_messages_to_stdin(
+                [_make_bot_worker_message(1)],
+                cli.BotStdinFormat.read,
+            ),
+            "text": True,
+        },
+    ]
+    assert marked == [
+        {"messages": [1], "op": "add", "flag": "read"},
+    ]
 @
 
 If fresh unread work survives the post-run drain, the bot should launch
@@ -4373,6 +4518,8 @@ def test_bot_retries_failed_worker_with_backoff(monkeypatch):
 Deleting a pending message should clear it from the unread set in the
 same way as marking it read.
 Otherwise the bot could keep retrying for work that no longer exists.
+As in the previous reconciliation test, we keep one extra empty queue
+batch so the success path reaches its acknowledgement decision.
 
 <<test functions>>=
 def test_bot_drops_deleted_messages_from_pending_set(monkeypatch):
@@ -4395,6 +4542,10 @@ def test_bot_drops_deleted_messages_from_pending_set(monkeypatch):
         {
             "result": "success",
             "events": [_make_bot_delete_event(1, message_id=1)],
+        },
+        {
+            "result": "success",
+            "events": [],
         },
         KeyboardInterrupt,
     ]
