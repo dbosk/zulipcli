@@ -24,7 +24,8 @@ stay flat because each speaks to a different Zulip concept:
 \item[streams] List available streams.
 \item[topics] List the topics inside a stream.
 \item[read] Read the history of a stream or one topic within it.
-\item[bot] Run a long-lived worker whenever unread messages exist.
+\item[bot] Run an external worker command, given after [[--]], whenever
+  unread messages exist, feeding the unread messages to it on stdin.
 \end{description}
 
 We keep the subcommand pattern familiar from Git and the
@@ -166,7 +167,7 @@ def build_embedded_app(
         parent.add_typer(build_embedded_app(), name="zulip")
 
     The host callback should store the resolved zuliprc path in
-    ``ctx.obj["zuliprc"]`` before the embedded commands run.
+    `ctx.obj["zuliprc"]` before the embedded commands run.
     """
     embedded_app = typer.Typer(
         help=APP_HELP if help is None else help,
@@ -3223,6 +3224,17 @@ remaining arguments through untouched.
 That keeps worker flags available without forcing this command to know
 anything about them.
 
+This pass-through design is invisible in the generated usage line: with
+no declared positional argument, Typer can only print
+[[bot [OPTIONS]]] and never mentions the worker command at all.
+We therefore carry the [[--]] contract in the help text instead---the
+docstring above explains it in prose, and a command [[epilog]] shows a
+runnable example so a reader can copy the shape without guessing.
+We keep that example on a single line: Typer renders help through Rich,
+which ignores Click's [[\b]] no-rewrap marker, so a multi-line example
+would be reflowed into one run-on line with a stray continuation
+backslash.
+
 The worker also needs the unread messages themselves.
 Some workers are easiest to drive with the plain text that [[read]]
 already prints, while others want a machine-readable format.
@@ -3234,6 +3246,10 @@ BOT_CONTEXT_SETTINGS = {
     "allow_extra_args": True,
     "ignore_unknown_options": True,
 }
+BOT_HELP_EPILOG = (
+    "Example: zulipcli bot -- opencode run -s ses_ABC "
+    '-m github-copilot/gpt-5.4 "There are new messages."'
+)
 BOT_EVENT_TYPES = [
     "message",
     "update_message_flags",
@@ -3263,7 +3279,15 @@ def _bot_handler(
         ),
     ] = BotStdinFormat.read,
 ):
-    """Run a worker whenever unread messages are pending."""
+    """Run an external worker whenever unread messages are pending.
+
+    Give the worker command and all of its own arguments after a `--`
+    separator; zulipcli passes them through untouched, so the worker may
+    take any flags it likes. The worker is launched each time unread
+    messages appear, and those unread messages are written to its stdin
+    in the format chosen by `--stdin-format` (the same plain text that
+    `zulipcli read` prints, or `json`).
+    """
     command = list(ctx.args)
     if not command:
         _exit_with_error("bot requires a worker command")
@@ -3369,7 +3393,7 @@ queue's [[all_public_streams]] scope.
 
 <<functions>>=
 def _get_messages_for_narrow(client, narrow):
-    """Return all messages matching ``narrow`` from oldest to newest."""
+    """Return all messages matching `narrow` from oldest to newest."""
     request = {
         "anchor": 0,
         "num_before": 0,
@@ -3455,7 +3479,7 @@ already consumed or deleted, we can skip the spawn entirely.
 
 <<functions>>=
 def _bot_messages_to_stdin(messages, stdin_format):
-    """Return the worker stdin payload for ``messages``."""
+    """Return the worker stdin payload for `messages`."""
     if stdin_format == BotStdinFormat.json:
         return json.dumps(messages)
     buffer = io.StringIO()
@@ -4687,16 +4711,18 @@ subcommands ride along; the remaining verbs stay flat.
 
 <<functions>>=
 def _register_commands(target: typer.Typer) -> None:
-    """Register Zulip subcommands on ``target``."""
+    """Register Zulip subcommands on `target`."""
     target.add_typer(users_app, name="users")
     target.command("send")(_send_handler)
     target.command("dm")(_dm_handler)
     target.command("streams")(_streams_handler)
     target.command("topics")(_topics_handler)
     target.command("read")(_read_handler)
-    target.command("bot", context_settings=BOT_CONTEXT_SETTINGS)(
-        _bot_handler
-    )
+    target.command(
+        "bot",
+        context_settings=BOT_CONTEXT_SETTINGS,
+        epilog=BOT_HELP_EPILOG,
+    )(_bot_handler)
 @
 
 <<functions>>=
@@ -4737,7 +4763,7 @@ def _stdout_is_tty():
 
 <<functions>>=
 def _write_read_content(file, content):
-    """Write raw read-command content to ``file``."""
+    """Write raw read-command content to `file`."""
     print(content, file=file)
 @
 
@@ -4833,7 +4859,7 @@ def _mark_message_ids_as_read(client, message_ids):
 
 <<functions>>=
 def _read_messages(client, narrow, *, mark_as_read):
-    """Read all messages matching ``narrow`` from oldest to newest."""
+    """Read all messages matching `narrow` from oldest to newest."""
     request = {
         "anchor": 0,
         "num_before": 0,
