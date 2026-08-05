@@ -1,6 +1,6 @@
 [project]
 name = "zulipcli"
-version = "0.7"
+version = "0.8"
 description = "Command-line interface for Zulip"
 authors = [
   {name = "Daniel Bosk", email = "daniel@bosk.se"}
