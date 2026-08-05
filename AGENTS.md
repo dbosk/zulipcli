@@ -28,6 +28,31 @@ Do not hand-edit generated files such as:
 
 After editing a `.nw` file, regenerate derived artifacts before testing.
 
+### Top-level chunk buckets in `cli.nw`
+
+The root chunk names four buckets, and the order is load-bearing. Every
+bucket may rely on the ones before it and none may rely on the ones
+after:
+
+1. `<<constants>>` — module-level bindings.
+2. `<<applications>>` — the Typer objects (`app`, `users_app`), and
+   only those.
+3. `<<functions>>` — definitions only: `def` and `class`, decorated or
+   not. **Never** a standalone assignment or a bare call.
+4. `<<command registration>>` — statements that need the definitions to
+   exist. Currently just `_register_commands(app)`.
+
+Put a new command's handler in `<<functions>>` and its `\section`
+wherever it reads best. Because the applications are created before the
+definitions, a `@users_app.command(...)` decorator is fine in
+`<<functions>>` — it depends on an object that already exists. A bare
+call is not, because it depends on other definitions, and that is what
+makes a chunk's position silently constrain every section after it.
+
+The rule is module level only: decorators inside a function body (see
+`build_embedded_app()`) and `@pytest.fixture` in the test chunks are
+unaffected.
+
 ## Build And Test
 
 Common commands:

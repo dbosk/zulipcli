@@ -44,6 +44,56 @@ option names, and argument values.
 
 
 \section{Program structure}
+\label{sec:structure}
+
+The module has four top-level buckets, and the order in which the root
+chunk below names them is the whole design:
+
+\begin{description}
+\item[constants] Module-level bindings. Each one names a value.
+\item[applications] The Typer objects, and only those.
+\item[functions] Definitions---[[def]] and [[class]], decorated or
+  not---and nothing that stands on its own.
+\item[command registration] The statements that need those definitions
+  to already exist.
+\end{description}
+
+Every bucket may rely on the ones before it, and none may rely on the
+ones after.
+That single property is what leaves the rest of this document free to
+be arranged for a reader rather than for the tangler.
+
+It matters because a chunk's place in this document and its place in
+the tangled file are different things.
+Prose can be reordered whenever a different order reads better, but an
+executing statement travels with the prose around it and then runs
+against whatever happens to have been defined by that point.
+A bare call living among the definitions therefore constrains where
+every later section may go---silently, and at a distance.
+We learned that by doing it: while [[_register_commands(app)]] still
+sat in [[functions]], adding a new command section after it produced a
+module that would not import, and the error named the registration
+instead of the section that had moved.
+
+Creating the applications before the definitions is what lets a
+decorated handler stay wherever it belongs in the narrative.
+A decorator is an executing line, and [[@users_app.command("list")]]
+cannot run before [[users_app]] exists---but that is a dependency on an
+\emph{object}, and putting the two Typer applications first discharges
+it for every chunk in [[functions]] at once and for good.
+What stays forbidden there is a standalone assignment or call, because
+those depend on other \emph{definitions}, and that is a dependency
+neither the reader nor the tangler can see.
+[[_register_commands(app)]] is the only one this module has, and it
+goes last.
+
+The rule governs module level only.
+A decorator inside a function body---[[build_embedded_app()]] has
+one---runs when that function is called, by which point its target is a
+local variable that demonstrably exists.
+The test file keeps its [[pytest]] fixture decorators for the same
+reason: they depend on an import rather than on anything the file
+defines further down.
 
 The term index of \cref{sec:term-index} is the only part of this module
 that needs storage and fuzzy matching, and both come from the standard
@@ -81,7 +131,9 @@ import zulip
 import zulipcli
 
 <<constants>>
+<<applications>>
 <<functions>>
+<<command registration>>
 
 def main():
     """Entry point for the zulipcli command."""
@@ -109,9 +161,7 @@ surface.
 
 <<constants>>=
 APP_HELP = "Command-line interface for Zulip"
-@
-
-<<functions>>=
+<<applications>>=
 app = typer.Typer(
     help=APP_HELP,
     add_completion=True,
@@ -690,7 +740,7 @@ subcommand list rather than failing silently---useful both for
 discovery and as a migration signal for anyone still typing the flat
 [[zulipcli users PATTERN]] form that this tool used to accept.
 
-<<functions>>=
+<<applications>>=
 users_app = typer.Typer(
     help="List, invite, and inspect users on the server.",
     no_args_is_help=True,
@@ -6806,7 +6856,14 @@ def _register_commands(target: typer.Typer) -> None:
     )(_bot_handler)
 @
 
-<<functions>>=
+Calling it for the standalone application is the module's last
+executing statement, and by \cref{sec:structure} it has to be.
+The helper names every flat handler, so the call can only run once all
+of [[functions]] has been tangled ahead of it---which is exactly what
+putting it in its own bucket guarantees, no matter where this section
+ends up in the document.
+
+<<command registration>>=
 _register_commands(app)
 @
 
