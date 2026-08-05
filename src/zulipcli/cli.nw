@@ -9,6 +9,10 @@ look it up.
 Similarly, there is no command to list the available streams (channels),
 inspect the topics inside a stream, or read a stream's history from the
 terminal.
+Nor is there any way to find a message whose location we have
+forgotten---the question that matters most once a realm has enough
+history to be worth searching, and the one an automated agent has
+before it has any other.
 
 The [[zulipcli]] command fills these gaps.
 User administration---listing, inviting, and inspecting---is grouped
@@ -24,6 +28,10 @@ stay flat because each speaks to a different Zulip concept:
 \item[streams] List available streams.
 \item[topics] List the topics inside a stream.
 \item[read] Read the history of a stream or one topic within it.
+\item[search] Find messages anywhere in the history, one compact line
+  per hit, optionally limited to given streams, topics, or a sender.
+\item[terms] Look up the vocabulary this realm actually uses, from an
+  index built up while reading messages.
 \item[bot] Run an external worker command, given after [[--]], whenever
   unread messages exist, feeding the unread messages to it on stdin.
 \end{description}
@@ -37,16 +45,27 @@ option names, and argument values.
 
 \section{Program structure}
 
+The term index of \cref{sec:term-index} is the only part of this module
+that needs storage and fuzzy matching, and both come from the standard
+library: [[sqlite3]] for the index itself, [[difflib]] for term
+similarity, and [[os]] for the [[XDG_DATA_HOME]] lookup.
+Keeping them stdlib matters because this package declares exactly three
+runtime dependencies---[[zulip]], [[typer]], and [[rich]]---and a
+vocabulary cache is not worth a fourth.
+
 <<[[cli.py]]>>=
 """Command-line interface for Zulip."""
 
 import configparser
 from datetime import datetime, timezone
+import difflib
 from enum import Enum
 import io
 import json
+import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -214,6 +233,7 @@ def _require_success(result):
 
 
 \section{Completion lookups}
+\label{sec:completion}
 
 Typer already handles command-name and option-name completion.
 The remaining work is value completion for live Zulip data.
@@ -269,13 +289,34 @@ def complete_stream_names(ctx: typer.Context, incomplete: str):
 
 Topics depend on the selected stream, so their completion callback first
 resolves that stream name and then asks Zulip for the available topics.
-That same callback serves both [[read STREAM TOPIC]] and
-[[send --stream STREAM --topic TOPIC]].
+That same callback serves [[read STREAM TOPIC]],
+[[send --stream STREAM --topic TOPIC]], and
+[[search --stream STREAM --topic TOPIC]].
+
+That last caller is why the selected stream needs normalising before we
+use it.
+The [[search]] command accepts [[--stream]] more than once, and Click
+collects a repeatable option into a tuple rather than a string.
+Passing that tuple on to [[get_stream_id()]] would ask Zulip to resolve
+a stream whose name is the printed form of a Python tuple, and the
+lookup would simply fail.
+We keep the last value because the shell is completing the topic that
+follows the most recently typed [[--stream]], so that is the stream the
+user currently has in mind.
+
+<<functions>>=
+def _selected_stream_name(ctx: typer.Context):
+    """Return the stream selected in the current command context."""
+    stream = ctx.params.get("stream")
+    if isinstance(stream, (list, tuple)):
+        return stream[-1] if stream else None
+    return stream
+@
 
 <<functions>>=
 def complete_topic_names(ctx: typer.Context, incomplete: str):
     """Autocomplete topic names for the selected stream."""
-    stream = ctx.params.get("stream")
+    stream = _selected_stream_name(ctx)
     if not stream:
         return []
 
@@ -299,6 +340,31 @@ def complete_topic_names(ctx: typer.Context, incomplete: str):
         )
         if _matches_completion(topic["name"], incomplete)
     ]
+@
+
+Let's verify that a repeated [[--stream]] resolves to the stream the
+user typed most recently rather than to the whole tuple:
+
+<<test functions>>=
+def test_topic_completion_uses_the_last_repeated_stream(monkeypatch):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 7,
+    }
+    client.get_stream_topics.return_value = {
+        "result": "success",
+        "topics": [{"name": "deploys"}, {"name": "design"}],
+    }
+    monkeypatch.setattr(
+        cli,
+        "_get_completion_client",
+        lambda ctx: client,
+    )
+    ctx = SimpleNamespace(params={"stream": ("general", "backend")})
+
+    assert complete_topic_names(ctx, "de") == ["deploys", "design"]
+    client.get_stream_id.assert_called_once_with("backend")
 @
 
 Direct-message completion must cope with the fact that shells differ
@@ -377,6 +443,7 @@ subcommands without claiming that root option for itself.
 import copy
 import io
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -391,12 +458,15 @@ from zulipcli.cli import (
     HISTORY_BATCH_SIZE,
     InviteRole,
     app,
+    complete_indexed_terms,
     complete_stream_names,
     complete_topic_names,
     complete_user_emails,
     read_command,
+    search_command,
     send_command,
     streams_command,
+    terms_command,
     topics_command,
     users_invite_command,
     users_invited_command,
@@ -415,6 +485,8 @@ def test_cli_shows_help_without_command():
     assert "Commands" in result.output
     assert "bot" in result.output
     assert "read" in result.output
+    assert "search" in result.output
+    assert "terms" in result.output
 @
 
 <<test functions>>=
@@ -3200,7 +3272,1955 @@ def _read_handler(
     )
 @
 
+
+\section{The term index}
+\label{sec:term-index}
+
+Search quality is bounded by query quality, and a caller composing a
+query has to guess what this realm calls things.
+That guess is usually wrong.
+Swedish compounding and definite suffixes mean one concept surfaces as
+[[kryptografi]], [[kryptografin]], and [[kryptografikursen]], while
+local jargon such as an assignment label or a course code is not
+guessable at all.
+Asking the server does not help, because Zulip exposes no vocabulary
+endpoint---only search, which is the thing we are trying to aim.
+
+Every message we already fetch carries that vocabulary, though.
+Rather than crawl for it, we record the words of every message that
+passes through any reading command and answer vocabulary questions from
+that local record.
+The index costs no extra API calls, and it grows precisely where the
+user actually works.
+
+\subsection{Where the index lives}
+
+Two realms must never blend vocabularies.
+A term that is common at work says nothing about a hobby server, and
+merging the two would corrupt both the frequency counts and the
+co-occurrence signal that \cref{sec:terms} reports.
+We therefore key the database on the site the client is configured for.
+
+The client's [[base_url]] is the only realm identity available without
+spending an API call, but it is a URL rather than a filename.
+Stripping the scheme and any path, then replacing everything outside a
+safe character set, leaves a key that is both stable and readable in a
+directory listing.
+The type check is not defensive padding: [[base_url]] is a plain
+attribute, so a test double presents an object rather than a string
+there, and an unguarded substitution would fail inside every test that
+reads messages.
+
+<<constants>>=
+TERM_INDEX_UNKNOWN_SITE = "unknown"
+TERM_INDEX_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.I)
+TERM_INDEX_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+<<functions>>=
+def _term_index_site(client):
+    """Return a filesystem-safe site key for `client`."""
+    base_url = getattr(client, "base_url", None)
+    if not isinstance(base_url, str):
+        return TERM_INDEX_UNKNOWN_SITE
+    site = TERM_INDEX_SCHEME_RE.sub("", base_url).split("/")[0]
+    return TERM_INDEX_UNSAFE_RE.sub("_", site) or \
+        TERM_INDEX_UNKNOWN_SITE
+@
+
+The index is regenerable but not disposable mid-run, which is what the
+XDG base directory specification calls data rather than cache.
+Honouring [[XDG_DATA_HOME]] before the default also gives tests and
+sandboxes a single variable that relocates the whole thing, which is
+what keeps the test suite from writing into the developer's own index.
+
+<<functions>>=
+def _term_data_dir():
+    """Return the directory holding zulipcli's local data."""
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home) / "zulipcli"
+    return Path.home() / ".local" / "share" / "zulipcli"
+@
+
+<<functions>>=
+def _term_index_path(client):
+    """Return the term-index database path for `client`."""
+    return _term_data_dir() / f"terms-{_term_index_site(client)}.db"
+@
+
+Because indexing happens on every reading command, any test that reads
+messages would otherwise touch the real database.
+One autouse fixture redirects the whole data directory, so isolation is
+the default rather than something each test has to remember.
+
+<<test functions>>=
+@pytest.fixture(autouse=True)
+def isolated_term_index(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    return tmp_path / "data" / "zulipcli"
+@
+
+<<test functions>>=
+def _make_indexing_client(site="https://chat.example.com/api/"):
+    client = MagicMock()
+    client.base_url = site
+    return client
+@
+
+Let's verify that the location follows the environment and that two
+sites never share a database:
+
+<<test functions>>=
+def test_term_index_path_uses_xdg_data_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    path = cli._term_index_path(_make_indexing_client())
+
+    assert path == tmp_path / "zulipcli" / "terms-chat.example.com.db"
+@
+
+<<test functions>>=
+def test_term_index_path_falls_back_to_local_share(monkeypatch):
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(cli.Path, "home", classmethod(
+        lambda cls: cls("/home/tester")
+    ))
+    path = cli._term_index_path(_make_indexing_client())
+
+    assert path == cli.Path(
+        "/home/tester/.local/share/zulipcli/terms-chat.example.com.db"
+    )
+@
+
+<<test functions>>=
+def test_term_index_keys_the_database_per_site():
+    first = cli._term_index_path(_make_indexing_client())
+    second = cli._term_index_path(
+        _make_indexing_client("https://other.zulipchat.com/api/")
+    )
+
+    assert first != second
+    assert second.name == "terms-other.zulipchat.com.db"
+@
+
+A client without a usable site---every [[MagicMock]] in this test
+suite---must still produce a path rather than raise:
+
+<<test functions>>=
+def test_term_index_path_tolerates_a_client_without_a_site():
+    path = cli._term_index_path(MagicMock())
+
+    assert path.name == "terms-unknown.db"
+@
+
+\subsection{The database}
+
+Three tables answer the three questions the index exists for: which
+messages have already been counted, how often each term occurs, and
+which terms occur together.
+
+Pairs are stored in both directions, which doubles the rows.
+That is deliberate.
+A lookup then reads [[WHERE term = ?]], which uses the leftmost column
+of the composite primary key; storing each pair once would force
+[[WHERE term = ? OR other = ?]], and the second alternative cannot use
+that key at all.
+For the same reason [[pairs]] carries no secondary index---it would
+only duplicate the key's prefix---and [[WITHOUT ROWID]] stores the rows
+inside the key itself instead of in a separate table.
+
+<<constants>>=
+TERM_INDEX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    message_id INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS terms (
+    term TEXT PRIMARY KEY,
+    hits INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pairs (
+    term TEXT NOT NULL,
+    other TEXT NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (term, other)
+) WITHOUT ROWID;
+"""
+@
+
+The [[bot]] command keeps a process online that writes the index on
+every batch it reads, so an interactive lookup can easily arrive while
+a write is in flight.
+Write-ahead logging is what makes that safe without either side
+blocking: readers see the last committed state while a writer appends.
+The timeout covers the remaining case of two writers, and
+[[synchronous=NORMAL]] is the setting WAL is designed around, which
+spares us an fsync for every page of history we read.
+
+The file mode matters because the index records what its owner reads.
+Nothing in it can reconstruct a message, but on a shared machine the
+word list is still the user's business alone.
+
+<<constants>>=
+TERM_INDEX_TIMEOUT = 5.0
+TERM_INDEX_FILE_MODE = 0o600
+<<functions>>=
+def _term_index_connection(client):
+    """Open the term index for `client`, creating it when needed."""
+    path = _term_index_path(client)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=TERM_INDEX_TIMEOUT)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.executescript(TERM_INDEX_SCHEMA)
+    try:
+        path.chmod(TERM_INDEX_FILE_MODE)
+    except OSError:
+        pass
+    return connection
+@
+
+\subsection{What counts as a term}
+
+A term is a run of letters and digits, optionally joined by a hyphen or
+an apostrophe, casefolded.
+The word pattern excludes [[_]] deliberately: Python's [[\w]] includes
+it, which would fuse an identifier into a single token and let Markdown
+emphasis leak into the vocabulary.
+Everything else [[\w]] matches stays, and that is the point---under
+Python's Unicode semantics the pattern keeps every letter, so a Swedish
+realm indexes Swedish words rather than a mangled transliteration.
+Casefolding rather than lowercasing matches
+[[_matches_completion()]] from \cref{sec:completion}, so the whole
+module agrees on one notion of caseless equality.
+
+Digits survive inside a token, but a token containing no letter at all
+is dropped: an assignment label like [[inl1]] or a course code is
+exactly the vocabulary a caller cannot guess, whereas a bare year is
+noise.
+
+The order of the four substitutions is load-bearing.
+A fenced code block may itself contain quoted lines and links, so code
+goes first and takes its contents with it.
+Mentions and channel references go last because they are the only
+pattern that survives the earlier passes intact; stripping them keeps
+people's names, which are not realm vocabulary, from dominating the
+co-occurrence counts.
+
+<<constants>>=
+TERM_MIN_LENGTH = 3
+TERM_MAX_PER_MESSAGE = 16
+TERM_CODE_RE = re.compile(
+    r"```.*?```|~~~.*?~~~|`[^`\n]*`",
+    re.DOTALL,
+)
+TERM_QUOTE_RE = re.compile(r"^[ \t]*>.*$", re.MULTILINE)
+TERM_URL_RE = re.compile(r"(?:https?://|www\.)\S+")
+TERM_MENTION_RE = re.compile(r"[@#]_?\*{1,2}[^*]*\*{1,2}")
+TERM_WORD_RE = re.compile(r"[^\W_]+(?:[-'][^\W_]+)*")
+@
+
+Function words have to go.
+Without them every co-occurrence list reads [[och]], [[att]], [[det]],
+[[the]], [[and]]---an answer that is perfectly correct and completely
+useless, and improving queries is the only reason this index exists.
+The list covers Swedish and English because this realm mixes them, and
+it needs only the longer words, since anything shorter than the minimum
+length is dropped before the list is consulted.
+
+We stop short of stemming, and that is a decision rather than an
+omission.
+Swedish compounding and definite suffixes are precisely the variation
+\cref{sec:terms} exists to surface: someone who types [[kryptografi]]
+wants to be told that the realm writes [[kryptografin]].
+A stemmer would collapse that distinction before the similarity lookup
+ever saw it, destroying the signal it feeds on.
+Here the fuzzy matcher \emph{is} the stemmer.
+
+<<constants>>=
+TERM_STOPWORDS = frozenset(
+    """
+    about after also and any are back because been before being both
+    but can could did does doing done down each else even every for
+    from get gets getting give going good got had has have here how
+    into its just know like made make many may maybe might more most
+    much must need not now off one only other our out over own put
+    really said same say see seem should since some still such take
+    than that the their them then there these they thing think this
+    those though thought through too try use used using very want was
+    way well were what when where which while who why will with would
+    yes yet you your
+    alla alltid andra att bara blev bli blir borde bra både där då dem
+    den denna deras dessa det detta din ditt eftersom efter eller ett
+    fick finns flera från får för före gick går göra gör hade han hans
+    har hela heller hen hennes hon honom hos hur här igen inga ingen
+    inget inte kan kanske kom komma kommer kunde kunna lite man med
+    mellan men mer mest mig min mina mitt mycket många måste något
+    några någon nästa när och också oss redan sedan ser sig sin sina
+    sitt ska skall skulle som står säger sätt till tycker under utan
+    vad var vara varit varje vem vet vid vilka vilken vill väl vår
+    våra även över
+    """.split()
+)
+@
+
+The per-message cap bounds the pair count.
+Co-occurrence is quadratic in the terms of a single message, so one
+unbounded long post could contribute thousands of pairs by itself.
+Taking the first distinct terms in document order rather than the
+rarest keeps this a single pass with no dependence on global counts,
+and a Zulip message states its subject in its opening sentence---the
+tail is usually quoted context or a sign-off.
+
+<<functions>>=
+def _message_terms(content):
+    """Return the distinct indexable terms of one message body."""
+    text = TERM_CODE_RE.sub(" ", content)
+    text = TERM_QUOTE_RE.sub(" ", text)
+    text = TERM_URL_RE.sub(" ", text)
+    text = TERM_MENTION_RE.sub(" ", text)
+
+    terms = []
+    seen = set()
+    for match in TERM_WORD_RE.finditer(text):
+        term = match.group().casefold()
+        if len(term) < TERM_MIN_LENGTH or term in seen:
+            continue
+        if term in TERM_STOPWORDS:
+            continue
+        if not any(character.isalpha() for character in term):
+            continue
+        seen.add(term)
+        terms.append(term)
+        if len(terms) == TERM_MAX_PER_MESSAGE:
+            break
+    return terms
+@
+
+Let's verify that Swedish survives the tokenizer intact, since an
+ASCII-folding pattern would silently reduce this realm's vocabulary to
+noise:
+
+<<test functions>>=
+def test_message_terms_keeps_swedish_letters():
+    terms = cli._message_terms("Kryptografi är kul på KTH")
+
+    assert terms == ["kryptografi", "kul", "kth"]
+@
+
+Code, links, and mentions are all text that looks like vocabulary but
+is not, so each should disappear before tokenizing:
+
+<<test functions>>=
+def test_message_terms_drops_code_links_and_mentions():
+    terms = cli._message_terms(
+        "`deploy_script` and ```rollback here``` plus "
+        "https://example.com/runbook with @**Alice Admin** in "
+        "#**general>deploys** migration"
+    )
+
+    assert terms == ["plus", "migration"]
+@
+
+<<test functions>>=
+def test_message_terms_drops_quoted_replies():
+    terms = cli._message_terms(
+        "> quoted original claim\nmy actual answer"
+    )
+
+    assert terms == ["actual", "answer"]
+@
+
+Course codes and assignment labels are the vocabulary a caller is least
+able to guess, so a digit inside a word must not disqualify it even
+though a bare number should be dropped:
+
+<<test functions>>=
+def test_message_terms_keeps_labels_but_drops_bare_numbers():
+    terms = cli._message_terms("INL1 for DD1349 due 2024 on 15")
+
+    assert terms == ["inl1", "dd1349", "due"]
+@
+
+<<test functions>>=
+def test_message_terms_caps_terms_per_message():
+    content = " ".join(f"word{index:02d}" for index in range(40))
+    terms = cli._message_terms(content)
+
+    assert len(terms) == cli.TERM_MAX_PER_MESSAGE
+    assert terms[0] == "word00"
+@
+
+\subsection{Recording what we read}
+
+Re-reading a topic must not inflate the counts, or frequency stops
+meaning frequency and starts meaning \enquote{how often did I look at
+this}.
+The [[messages]] table is the guard, and how it is consulted is the
+part worth getting right.
+[[INSERT OR IGNORE]] reports a row count of one when it inserted and
+zero when it collided, so claiming the message and testing whether it
+was new are a single atomic statement.
+Checking with a separate query first would leave a window in which a
+concurrently running [[bot]] claims the same message, after which both
+processes would count it.
+
+The whole batch shares one transaction, which makes the invariant easy
+to state: a message ID is present exactly when its terms have been
+counted.
+A crash rolls the claims back along with the counts, so the batch is
+simply indexed again next time instead of being recorded as seen with
+nothing to show for it.
+
+The context manager deserves a note, because [[sqlite3]] uses it for
+transactions rather than for closing.
+Leaving the [[with]] block commits or rolls back but keeps the
+connection open, so the explicit close in the [[finally]] clause is not
+redundant.
+
+<<functions>>=
+def _index_messages(client, messages):
+    """Record the vocabulary of `messages` in the term index."""
+    connection = _term_index_connection(client)
+    try:
+        with connection:
+            for message in messages:
+                <<skip messages already indexed>>
+                <<count the terms of one message>>
+                <<count the co-occurring pairs>>
+    finally:
+        connection.close()
+@
+
+A message with no indexable terms still keeps its claim.
+Tokenizing it again later would reach the same conclusion, so there is
+nothing to gain by leaving it unclaimed.
+
+<<skip messages already indexed>>=
+claim = connection.execute(
+    "INSERT OR IGNORE INTO messages (message_id) VALUES (?)",
+    (message["id"],),
+)
+if claim.rowcount == 0:
+    continue
+terms = _message_terms(message.get("content") or "")
+if not terms:
+    continue
+@
+
+Both counting steps are upserts, so a term's first occurrence and its
+thousandth take the same statement and neither needs a prior lookup.
+
+<<count the terms of one message>>=
+connection.executemany(
+    "INSERT INTO terms (term, hits) VALUES (?, 1) "
+    "ON CONFLICT(term) DO UPDATE SET hits = hits + 1",
+    [(term,) for term in terms],
+)
+@
+
+<<count the co-occurring pairs>>=
+connection.executemany(
+    "INSERT INTO pairs (term, other, hits) VALUES (?, ?, 1) "
+    "ON CONFLICT(term, other) DO UPDATE SET hits = hits + 1",
+    [
+        (term, other)
+        for term in terms
+        for other in terms
+        if term != other
+    ],
+)
+@
+
+<<test functions>>=
+def _read_term_index(client):
+    connection = sqlite3.connect(cli._term_index_path(client))
+    try:
+        terms = dict(
+            connection.execute("SELECT term, hits FROM terms")
+        )
+        pairs = {
+            (term, other): hits
+            for term, other, hits in connection.execute(
+                "SELECT term, other, hits FROM pairs"
+            )
+        }
+    finally:
+        connection.close()
+    return terms, pairs
+@
+
+Let's verify that a batch produces both frequency and co-occurrence
+counts, and that pairs are recorded in both directions:
+
+<<test functions>>=
+def test_index_messages_counts_terms_and_pairs():
+    client = _make_indexing_client()
+    cli._index_messages(client, [
+        {"id": 1, "content": "migration backfill"},
+        {"id": 2, "content": "migration rollback"},
+    ])
+    terms, pairs = _read_term_index(client)
+
+    assert terms == {
+        "migration": 2,
+        "backfill": 1,
+        "rollback": 1,
+    }
+    assert pairs[("migration", "backfill")] == 1
+    assert pairs[("backfill", "migration")] == 1
+    assert ("backfill", "rollback") not in pairs
+@
+
+This next test is the one that matters most.
+Indexing rides along with reading, and re-reading a topic is completely
+ordinary, so counts that grew on every read would make the whole index
+measure attention rather than vocabulary:
+
+<<test functions>>=
+def test_index_messages_is_idempotent_for_repeated_reads():
+    client = _make_indexing_client()
+    batch = [
+        {"id": 1, "content": "migration backfill"},
+        {"id": 2, "content": "migration rollback"},
+    ]
+    cli._index_messages(client, batch)
+    before = _read_term_index(client)
+    cli._index_messages(client, batch)
+
+    assert _read_term_index(client) == before
+@
+
+A message that contributes no terms must still be claimed, otherwise
+every later read would re-tokenize it for nothing:
+
+<<test functions>>=
+def test_index_messages_claims_messages_without_terms():
+    client = _make_indexing_client()
+    cli._index_messages(client, [{"id": 1, "content": "och att"}])
+    connection = sqlite3.connect(cli._term_index_path(client))
+    try:
+        claimed = connection.execute(
+            "SELECT message_id FROM messages"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert claimed == [(1,)]
+@
+
+\subsection{Indexing without endangering the read}
+
+Indexing is a side effect of reading, and a side effect must never be
+able to break the thing it rides along with.
+A read-only data directory, a corrupted database, a filesystem whose
+locking SQLite cannot use---none of those are the user's problem when
+they asked to read a topic, so every failure here is swallowed.
+
+The opt-out is an environment variable rather than a flag.
+A flag would have to be threaded identically through [[read]], [[dm]],
+[[search]], and [[bot]], and nobody wants to decide this once per
+invocation; the realistic preference is \enquote{on this machine,
+never}, which is exactly what an environment variable expresses.
+
+<<constants>>=
+TERM_INDEX_DISABLED_ENV = "ZULIPCLI_NO_TERM_INDEX"
+<<functions>>=
+def _index_messages_safely(client, messages):
+    """Index `messages`, never failing the caller's read."""
+    if not messages or os.environ.get(TERM_INDEX_DISABLED_ENV):
+        return
+    try:
+        _index_messages(client, messages)
+    except Exception:
+        pass
+@
+
+<<test functions>>=
+def test_index_messages_ignores_write_failures(monkeypatch):
+    def explode(client):
+        raise sqlite3.OperationalError("unable to open database")
+
+    monkeypatch.setattr(cli, "_term_index_connection", explode)
+
+    cli._index_messages_safely(
+        _make_indexing_client(),
+        [{"id": 1, "content": "migration"}],
+    )
+@
+
+<<test functions>>=
+def test_index_messages_respects_the_disable_variable(monkeypatch):
+    monkeypatch.setenv(cli.TERM_INDEX_DISABLED_ENV, "1")
+    client = _make_indexing_client()
+
+    cli._index_messages_safely(
+        client,
+        [{"id": 1, "content": "migration"}],
+    )
+
+    assert not cli._term_index_path(client).exists()
+@
+
+\subsection{Completing words from the index}
+
+The index earns its keep at the shell prompt too.
+With it, [[search krypto]] followed by a tab offers the words this
+realm actually uses---the same question \cref{sec:terms} answers, but
+at the moment the query is being typed rather than after a failed
+search.
+
+We match on a range rather than with [[LIKE]] so that a prefix
+containing a wildcard character needs no escaping and the query rides
+the primary key.
+Opening the database read-only means a missing index raises instead of
+being created empty, since completion should never write; as with every
+callback in \cref{sec:completion}, the failure is silent.
+
+<<constants>>=
+TERM_COMPLETION_LIMIT = 50
+TERM_RANGE_SENTINEL = "\uffff"
+<<functions>>=
+def complete_indexed_terms(ctx: typer.Context, incomplete: str):
+    """Autocomplete search words from the local term index."""
+    client = _get_completion_client(ctx)
+    if client is None:
+        return []
+
+    prefix = incomplete.casefold()
+    try:
+        connection = sqlite3.connect(
+            f"file:{_term_index_path(client)}?mode=ro",
+            uri=True,
+            timeout=TERM_INDEX_TIMEOUT,
+        )
+        try:
+            rows = connection.execute(
+                "SELECT term FROM terms WHERE term >= ? AND term < ? "
+                "ORDER BY hits DESC, term LIMIT ?",
+                (prefix, prefix + TERM_RANGE_SENTINEL,
+                 TERM_COMPLETION_LIMIT),
+            ).fetchall()
+        finally:
+            connection.close()
+    except Exception:
+        return []
+    return [row[0] for row in rows]
+@
+
+Let's verify that completion ranks by how often the realm uses a word,
+and that it stays silent when no index exists yet:
+
+<<test functions>>=
+def test_indexed_term_completion_ranks_by_frequency(monkeypatch):
+    client = _make_indexing_client()
+    cli._index_messages(client, [
+        {"id": index, "content": "kryptografi kryptovaluta"}
+        for index in range(3)
+    ] + [{"id": 9, "content": "kryptografi tenta"}])
+    monkeypatch.setattr(
+        cli,
+        "_get_completion_client",
+        lambda ctx: client,
+    )
+
+    assert complete_indexed_terms(None, "krypto") == [
+        "kryptografi",
+        "kryptovaluta",
+    ]
+@
+
+<<test functions>>=
+def test_indexed_term_completion_is_silent_without_an_index(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cli,
+        "_get_completion_client",
+        lambda ctx: _make_indexing_client(),
+    )
+
+    assert complete_indexed_terms(None, "krypto") == []
+@
+
+
+\section{The \texttt{search} subcommand}
+\label{sec:search}
+
+The commands so far all answer \enquote{what happened here}: point them
+at a stream, a topic, or a conversation and they replay it.
+[[search]] answers the prior question---\enquote{where was this
+mentioned}---which is the one an agent or a newcomer actually has,
+because neither knows the stream and topic yet.
+
+Zulip does the matching; the work here is scope and shape.
+The scope problem comes from the fact that a Zulip narrow is a
+conjunction: every term in it must hold at once.
+Two [[stream]] terms in one narrow therefore ask for messages posted in
+two channels simultaneously, which is nothing at all, so a repeatable
+[[--stream]] cannot become a longer narrow.
+It has to become \emph{more narrows}, run separately and merged by
+message ID.
+\Cref{sec:reading-engine} already contains that pattern in
+[[_get_all_visible_unread_messages()]], which merges an ordinary unread
+query with a public-channel one; [[search]] generalises it to the cross
+product of the scope options.
+
+That same conjunction is why [[--sender]] takes one regex rather than
+many.
+A repeatable version would look symmetric with [[--stream]] but would
+quietly return nothing whenever it was used with two patterns, and a
+silent empty result is worse than a missing feature.
+
+<<functions>>=
+class SearchScope(str, Enum):
+    """Conversation kinds a search can be limited to."""
+
+    all = "all"
+    streams = "streams"
+    dms = "dms"
+@
+
+<<functions>>=
+class SearchHas(str, Enum):
+    """Message contents a search can require."""
+
+    link = "link"
+    image = "image"
+    attachment = "attachment"
+@
+
+Enumerations rather than a family of mutually exclusive flags: Typer
+derives both validation and completion from them, and a caller cannot
+express a contradiction such as streams-only-and-DMs-only in the first
+place.
+This follows [[BotStdinFormat]] from \cref{sec:bot}.
+
+The default limit exists because search is the one command whose result
+set is unbounded by anything the user said.
+[[read general]] is as long as that channel; [[search the]] is as long
+as the realm's whole history.
+Fifty recent hits fit a screen and answer the question that was asked,
+and [[0]] restores the unbounded behaviour for scripts that want it.
+
+The narrow cap guards the fan-out.
+Each combination is a full paginated scan, so five streams crossed with
+five topics is twenty-five sequential passes over history---slow enough
+to look like a hang, and almost never what the caller meant.
+
+<<constants>>=
+SEARCH_DEFAULT_LIMIT = 50
+SEARCH_MAX_NARROWS = 12
+SEARCH_SNIPPET_WIDTH = 100
+SEARCH_SNIPPET_ELLIPSIS = "..."
+@
+
+\subsection{Resolving the sender}
+
+Sender narrows take a user ID, but making the caller look one up would
+undo the point of the command.
+We therefore accept the same regex that [[send --to]] and [[dm]] accept
+and resolve it through the shared matcher of
+[[_resolve_direct_recipients()]].
+
+Ambiguity is an error rather than a prompt.
+[[send]] can afford to ask which recipients were meant because the
+answer changes who receives a message; here the caller is composing a
+query, and listing every match tells them how to make it precise in one
+step.
+
+<<functions>>=
+def _search_sender_id(client, pattern):
+    """Return the user ID of the one sender matching `pattern`."""
+    users = _resolve_direct_recipients(client, [pattern])
+    described = _describe_patterns([pattern])
+    if not users:
+        _exit_with_error(
+            f"--sender {described} matched no active users"
+        )
+    if len(users) > 1:
+        names = ", ".join(user["full_name"] for user in users)
+        _exit_with_error(
+            f"--sender {described} matched several users: {names}"
+        )
+    return users[0]["user_id"]
+@
+
+<<test functions>>=
+def test_search_sender_resolves_regex_to_user_id():
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+
+    assert cli._search_sender_id(client, "Diana") == 4
+@
+
+<<test functions>>=
+def test_search_sender_rejects_an_ambiguous_regex(capsys):
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._search_sender_id(client, "a")
+
+    assert excinfo.value.code == 1
+    error = capsys.readouterr().err
+    assert "matched several users" in error
+    assert "Alice Admin" in error
+@
+
+\subsection{Building the queries}
+
+The terms split cleanly by what they depend on.
+One group is fixed for the whole invocation---the words themselves, the
+sender, the conversation kind, the content requirements, and unread
+filtering---and can be computed once.
+
+<<functions>>=
+def _search_base_terms(client, args):
+    """Return the narrow terms shared by every search query."""
+    terms = [
+        {"operator": "search", "operand": word}
+        for word in args.query
+    ]
+    if args.sender:
+        terms.append({
+            "operator": "sender",
+            "operand": _search_sender_id(client, args.sender),
+        })
+    if args.scope == SearchScope.dms:
+        terms.append({"operator": "is", "operand": "dm"})
+    elif args.scope == SearchScope.streams:
+        terms.append({
+            "operator": "is",
+            "operand": "dm",
+            "negated": True,
+        })
+    for required in args.has or []:
+        terms.append({"operator": "has", "operand": required.value})
+    if args.unread:
+        terms.append({"operator": "is", "operand": "unread"})
+    return terms
+@
+
+Each positional argument becomes its own [[search]] term rather than
+being joined into one string.
+Zulip ANDs the terms, so the effect is the same conjunction a user
+expects from a search box---but the caller's own quoting survives, and
+[[search "gamla tentor" krypto]] stays a phrase plus a word instead of
+collapsing into one long phrase that matches nothing.
+
+The other group is the conversation filter, and this is where one query
+becomes several.
+Repeated streams and topics multiply out, and a bare topic with no
+stream is left as a topic-only narrow, which Zulip accepts and which is
+useful when the same topic name recurs across channels.
+
+<<functions>>=
+def _search_conversation_terms(args):
+    """Return one term list per stream and topic combination."""
+    streams = list(args.stream or [])
+    topics = list(args.topic or [])
+    if not streams and not topics:
+        return [[]]
+
+    combinations = []
+    for stream in streams or [None]:
+        for topic in topics or [None]:
+            terms = []
+            if stream is not None:
+                terms.append(
+                    {"operator": "stream", "operand": stream}
+                )
+            if topic is not None:
+                terms.append(
+                    {"operator": "topic", "operand": topic}
+                )
+            combinations.append(terms)
+    return combinations
+@
+
+The last axis is how much history to look at.
+By default a search covers what the account subscribes to, which is
+what \enquote{search my Zulip} means to a person.
+\Cref{sec:reading-engine} needs the wider public-channel scope for a
+different reason---the bot has to match its event queue---and paying
+for it on every search would double the queries to answer a question
+nobody asked.
+So the wider scope is opt-in, and it is skipped entirely under
+[[--scope dms]], where a channel clause could not match anything.
+
+<<functions>>=
+def _search_narrows(client, args):
+    """Return every narrow this search has to run."""
+    base = _search_base_terms(client, args)
+    conversations = _search_conversation_terms(args)
+
+    scopes = [[]]
+    if args.public and args.scope != SearchScope.dms:
+        scopes.append([{"operator": "channels", "operand": "public"}])
+
+    narrows = [
+        scope + conversation + base
+        for scope in scopes
+        for conversation in conversations
+    ]
+    if len(narrows) > SEARCH_MAX_NARROWS:
+        _exit_with_error(
+            f"search would need {len(narrows)} queries; use at most "
+            f"{SEARCH_MAX_NARROWS} --stream and --topic combinations"
+        )
+    return narrows
+@
+
+<<test functions>>=
+def _make_search_args(**overrides):
+    args = SimpleNamespace(
+        query=["migration"],
+        stream=None,
+        topic=None,
+        sender=None,
+        scope=cli.SearchScope.all,
+        has=None,
+        public=False,
+        unread=False,
+        limit=0,
+        full=False,
+    )
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+@
+
+Let's verify that repeated scope options multiply into separate
+queries, since folding them into one narrow would silently match
+nothing:
+
+<<test functions>>=
+def test_search_builds_one_narrow_per_stream_and_topic():
+    args = _make_search_args(
+        stream=["general", "backend"],
+        topic=["deploys"],
+    )
+
+    assert cli._search_narrows(MagicMock(), args) == [
+        [
+            {"operator": "stream", "operand": "general"},
+            {"operator": "topic", "operand": "deploys"},
+            {"operator": "search", "operand": "migration"},
+        ],
+        [
+            {"operator": "stream", "operand": "backend"},
+            {"operator": "topic", "operand": "deploys"},
+            {"operator": "search", "operand": "migration"},
+        ],
+    ]
+@
+
+<<test functions>>=
+def test_search_defaults_to_subscribed_history():
+    narrows = cli._search_narrows(MagicMock(), _make_search_args())
+
+    assert narrows == [
+        [{"operator": "search", "operand": "migration"}],
+    ]
+@
+
+<<test functions>>=
+def test_search_public_flag_adds_a_channels_public_narrow():
+    args = _make_search_args(public=True)
+
+    assert cli._search_narrows(MagicMock(), args) == [
+        [{"operator": "search", "operand": "migration"}],
+        [
+            {"operator": "channels", "operand": "public"},
+            {"operator": "search", "operand": "migration"},
+        ],
+    ]
+@
+
+<<test functions>>=
+def test_search_public_flag_is_ignored_for_direct_messages():
+    args = _make_search_args(
+        public=True,
+        scope=cli.SearchScope.dms,
+    )
+
+    assert cli._search_narrows(MagicMock(), args) == [
+        [
+            {"operator": "search", "operand": "migration"},
+            {"operator": "is", "operand": "dm"},
+        ],
+    ]
+@
+
+<<test functions>>=
+def test_search_stream_scope_negates_the_dm_operator():
+    args = _make_search_args(scope=cli.SearchScope.streams)
+
+    assert cli._search_narrows(MagicMock(), args) == [
+        [
+            {"operator": "search", "operand": "migration"},
+            {
+                "operator": "is",
+                "operand": "dm",
+                "negated": True,
+            },
+        ],
+    ]
+@
+
+<<test functions>>=
+def test_search_rejects_too_many_narrow_combinations(capsys):
+    args = _make_search_args(
+        stream=[f"stream{index}" for index in range(4)],
+        topic=[f"topic{index}" for index in range(4)],
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli._search_narrows(MagicMock(), args)
+
+    assert excinfo.value.code == 1
+    assert "would need 16 queries" in capsys.readouterr().err
+@
+
+\subsection{Reading the newest matches first}
+
+\Cref{sec:reading-engine} pages forward from the oldest message,
+because a transcript is read in order.
+A capped search wants the opposite end: the fifty most recent mentions,
+not the fifty oldest, which on any established realm would be years
+stale.
+
+Zulip's anchor model is symmetric, so this is the same loop reflected.
+We anchor at the newest message, request messages before it, and walk
+backwards until the server reports the oldest or we have enough.
+Each page is prepended, which keeps the accumulated list in
+oldest-to-newest order and lets the final slice take the newest
+[[limit]] entries.
+The empty-page check is what guarantees termination if a server ever
+returns no messages without also reporting [[found_oldest]].
+
+<<functions>>=
+def _get_newest_messages_for_narrow(client, narrow, limit):
+    """Return the newest `limit` messages matching `narrow`."""
+    request = _history_request(
+        narrow,
+        anchor="newest",
+        num_before=min(limit, HISTORY_BATCH_SIZE),
+        num_after=0,
+    )
+    messages = []
+    while len(messages) < limit:
+        result = _fetch_history_page(client, request)
+        page = result["messages"]
+        messages = page + messages
+        if result["found_oldest"] or not page:
+            break
+        request["anchor"] = messages[0]["id"] - 1
+        request["num_before"] = min(
+            limit - len(messages),
+            HISTORY_BATCH_SIZE,
+        )
+    return messages[-limit:]
+@
+
+Fetching the newest [[limit]] messages per narrow and then keeping the
+newest [[limit]] of the merged result is exact, not an approximation:
+any message in the union's newest [[limit]] is also within its own
+narrow's newest [[limit]], so nothing that belongs in the answer can be
+discarded by the per-narrow cap.
+
+\subsection{Showing the hits}
+
+A hit is a location, not a transcript.
+The caller wants to see enough to judge relevance and enough to go
+read the real thing, so the compact line carries when, who, where, the
+message ID, and a flattened excerpt.
+
+Tab-separated even on a terminal, unlike the tables used for
+[[users list]] and [[streams]].
+Those have bounded columns; a message excerpt does not, and a Rich
+table would wrap it across lines, which destroys both the one-hit-per-
+line property and the ability to pipe the output into [[grep]].
+The location renders as the same [[#channel>topic]] string that Zulip's
+own search box accepts, so a hit can be pasted straight back into the
+web client.
+
+<<functions>>=
+def _search_message_location(message):
+    """Return where one message was posted."""
+    if message.get("type") == "private":
+        return _read_message_target(message)
+    stream = message.get("display_recipient") or ""
+    return f"#{stream}>{_read_message_target(message)}"
+@
+
+<<functions>>=
+def _search_snippet(content):
+    """Return a one-line excerpt of a message body."""
+    text = " ".join(content.split())
+    if len(text) <= SEARCH_SNIPPET_WIDTH:
+        return text
+    trimmed = text[:SEARCH_SNIPPET_WIDTH].rstrip()
+    return trimmed + SEARCH_SNIPPET_ELLIPSIS
+@
+
+Collapsing all whitespace is what makes the line format trustworthy.
+Zulip message bodies contain newlines, and a body pasted verbatim would
+turn one hit into several apparent rows.
+
+<<functions>>=
+def _format_search_hit(message):
+    """Return one search result as a single tab-separated line."""
+    return "\t".join([
+        _format_message_timestamp(message),
+        message["sender_full_name"],
+        _search_message_location(message),
+        str(message["id"]),
+        _search_snippet(message.get("content") or ""),
+    ])
+@
+
+\subsection{Running the search}
+
+The command merges before it prints, which is why it does not simply
+call [[_read_messages()]].
+That helper fuses paging, printing, and acknowledgement into one pass,
+and all three assume a single narrow; a search has to see every
+narrow's results before it can tell which are the newest matches
+overall, or deduplicate a message that two narrows both returned.
+It still reuses the same pagination and the same renderer, so
+[[--full]] output is byte-for-byte what [[read]] would have printed.
+
+There is deliberately no [[--mark-as-read]].
+With a limit in play, a search fetches more than it shows, so marking
+would acknowledge messages that were truncated away; and without
+[[--full]] the caller has seen an excerpt rather than the message.
+Keeping the flag off also means a search can never starve the [[bot]]
+worker of the unread messages it triggers on.
+
+<<functions>>=
+def search_command(client, args):
+    """Search message history and print matching messages."""
+    if not args.query:
+        _exit_with_error("search requires a query")
+
+    messages_by_id = {}
+    for narrow in _search_narrows(client, args):
+        if args.limit:
+            found = _get_newest_messages_for_narrow(
+                client,
+                narrow,
+                args.limit,
+            )
+        else:
+            found = _get_messages_for_narrow(client, narrow)
+        for message in found:
+            messages_by_id[message["id"]] = message
+
+    messages = [
+        messages_by_id[message_id]
+        for message_id in sorted(messages_by_id)
+    ]
+    if args.limit:
+        messages = messages[-args.limit:]
+
+    for message in messages:
+        if args.full:
+            _print_read_message(message)
+        else:
+            print(_format_search_hit(message))
+@
+
+<<functions>>=
+def _search_handler(
+    ctx: typer.Context,
+    query: Annotated[
+        Optional[list[str]],
+        typer.Argument(
+            help="word or phrase to find; repeat to require several",
+            autocompletion=complete_indexed_terms,
+        ),
+    ] = None,
+    stream: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--stream",
+            "-s",
+            help="limit to a stream (channel); repeat for several",
+            autocompletion=complete_stream_names,
+        ),
+    ] = None,
+    topic: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--topic",
+            "-t",
+            help="limit to a topic; repeat for several",
+            autocompletion=complete_topic_names,
+        ),
+    ] = None,
+    sender: Annotated[
+        Optional[str],
+        typer.Option(
+            "--sender",
+            help="limit to one sender; regex over full name, "
+                 "Zulip email, and delivery email",
+            autocompletion=complete_user_emails,
+        ),
+    ] = None,
+    scope: Annotated[
+        SearchScope,
+        typer.Option(
+            "--scope",
+            help="which conversation kinds to search",
+        ),
+    ] = SearchScope.all,
+    has: Annotated[
+        Optional[list[SearchHas]],
+        typer.Option("--has", help="require this in the message"),
+    ] = None,
+    public: Annotated[
+        bool,
+        typer.Option(
+            "--public",
+            "-P",
+            help="also search public channels you do not follow",
+        ),
+    ] = False,
+    unread: Annotated[
+        bool,
+        typer.Option(
+            "--unread",
+            "-U",
+            help="only match unread messages",
+        ),
+    ] = False,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            "-n",
+            min=0,
+            help="show at most this many recent hits (0 for all)",
+        ),
+    ] = SEARCH_DEFAULT_LIMIT,
+    full: Annotated[
+        bool,
+        typer.Option(
+            "--full",
+            help="print whole messages instead of one-line hits",
+        ),
+    ] = False,
+):
+    """Search message history."""
+    search_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            query=query,
+            stream=stream,
+            topic=topic,
+            sender=sender,
+            scope=scope,
+            has=has,
+            public=public,
+            unread=unread,
+            limit=limit,
+            full=full,
+        ),
+    )
+@
+
+Let's verify that the CLI forwards each scope option unchanged:
+
+<<test functions>>=
+def test_search_cli_passes_query_and_scope_options(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "search_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, [
+        "search", "migration", "backfill",
+        "-s", "general", "-s", "backend",
+        "-t", "deploys",
+        "--scope", "streams",
+        "--public", "-U", "-n", "5", "--full",
+    ])
+
+    assert result.exit_code == 0
+    args = seen["args"]
+    assert args.query == ["migration", "backfill"]
+    assert args.stream == ["general", "backend"]
+    assert args.topic == ["deploys"]
+    assert args.scope == cli.SearchScope.streams
+    assert args.public is True
+    assert args.unread is True
+    assert args.limit == 5
+    assert args.full is True
+@
+
+<<test functions>>=
+def test_search_requires_a_query(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        search_command(MagicMock(), _make_search_args(query=None))
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: search requires a query\n"
+    )
+@
+
+A capped search must ask for the \emph{newest} matches.
+Anchoring at the oldest end would answer with the realm's earliest
+history, which is never what a search means:
+
+<<test functions>>=
+def test_search_limit_anchors_on_the_newest_messages(monkeypatch):
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return {
+            "result": "success",
+            "found_oldest": True,
+            "found_newest": True,
+            "messages": [
+                _make_stream_message(
+                    1, 0, "Alice Admin", "deploys", "migration ran"
+                ),
+            ],
+        }
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(limit=3))
+
+    assert requests == [{
+        "anchor": "newest",
+        "num_before": 3,
+        "num_after": 0,
+        "narrow": [{"operator": "search", "operand": "migration"}],
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }]
+@
+
+<<test functions>>=
+def test_search_limit_pages_backwards_until_satisfied(monkeypatch):
+    requests = []
+    pages = [
+        {
+            "result": "success",
+            "found_oldest": False,
+            "messages": [
+                _make_stream_message(
+                    8, 0, "Alice Admin", "deploys", "later"
+                ),
+            ],
+        },
+        {
+            "result": "success",
+            "found_oldest": False,
+            "messages": [
+                _make_stream_message(
+                    5, 0, "Alice Admin", "deploys", "earlier"
+                ),
+            ],
+        },
+    ]
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return pages[len(requests) - 1]
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(limit=2))
+
+    assert len(requests) == 2
+    assert requests[0]["num_before"] == 2
+    assert requests[1]["anchor"] == 7
+    assert requests[1]["num_before"] == 1
+@
+
+<<test functions>>=
+def test_search_limit_zero_reads_the_whole_history(monkeypatch):
+    requests = []
+
+    def get_messages(request):
+        requests.append(copy.deepcopy(request))
+        return {
+            "result": "success",
+            "found_newest": True,
+            "messages": [
+                _make_stream_message(
+                    1, 0, "Alice Admin", "deploys", "migration ran"
+                ),
+            ],
+        }
+
+    client = MagicMock()
+    client.get_messages.side_effect = get_messages
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(limit=0))
+
+    assert requests[0]["anchor"] == 0
+    assert requests[0]["num_after"] == HISTORY_BATCH_SIZE
+@
+
+Let's verify the compact line itself, since it is the format an agent
+will learn to parse:
+
+<<test functions>>=
+def test_search_prints_compact_tab_separated_hits(capsys, monkeypatch):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                4821,
+                0,
+                "Alice Admin",
+                "deploys",
+                "we rolled back\nthe deploy",
+            ),
+        ],
+    }
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args())
+
+    assert capsys.readouterr().out == (
+        "1970-01-01T00:00:00Z\tAlice Admin\t#general>deploys\t4821\t"
+        "we rolled back the deploy\n"
+    )
+@
+
+<<test functions>>=
+def test_search_flattens_and_truncates_long_bodies():
+    snippet = cli._search_snippet("word " * 200)
+
+    assert len(snippet) <= cli.SEARCH_SNIPPET_WIDTH + len(
+        cli.SEARCH_SNIPPET_ELLIPSIS
+    )
+    assert snippet.endswith(cli.SEARCH_SNIPPET_ELLIPSIS)
+    assert "\n" not in snippet
+@
+
+<<test functions>>=
+def test_search_labels_direct_messages_with_participants():
+    message = _make_dm_message(
+        7,
+        0,
+        "Alice Admin",
+        ["Alice Admin", "Diana Developer"],
+        "about the migration",
+    )
+
+    assert cli._search_message_location(message) == (
+        "Alice Admin, Diana Developer"
+    )
+@
+
+Two narrows can legitimately return the same message---a public-channel
+search overlaps a subscribed one---so the merge has to deduplicate:
+
+<<test functions>>=
+def test_search_dedupes_messages_across_narrows(capsys, monkeypatch):
+    message = _make_stream_message(
+        11, 0, "Alice Admin", "deploys", "migration ran"
+    )
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [message],
+    }
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(public=True))
+
+    assert client.get_messages.call_count == 2
+    assert capsys.readouterr().out.count("migration ran") == 1
+@
+
+<<test functions>>=
+def test_search_full_flag_uses_read_rendering(capsys, monkeypatch):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                11, 0, "Alice Admin", "deploys", "migration ran"
+            ),
+        ],
+    }
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(full=True))
+
+    assert capsys.readouterr().out == (
+        "1970-01-01T00:00:00Z\tAlice Admin\tdeploys\n"
+        "migration ran\n\n"
+    )
+@
+
+<<test functions>>=
+def test_search_never_marks_messages_as_read(monkeypatch):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [
+            _make_stream_message(
+                11, 0, "Alice Admin", "deploys", "migration ran"
+            ),
+        ],
+    }
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    search_command(client, _make_search_args(unread=True))
+
+    client.update_message_flags.assert_not_called()
+@
+
+<<test functions>>=
+def test_search_reports_history_errors(capsys):
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "error",
+        "msg": "Invalid narrow operator",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        search_command(client, _make_search_args())
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid narrow operator\n"
+    )
+@
+
+
+\section{The \texttt{terms} subcommand}
+\label{sec:terms}
+
+\Cref{sec:term-index} builds a record of this realm's vocabulary as a
+side effect of reading.
+This is where that record becomes answerable, and it answers two
+different questions.
+\enquote{What did I probably mean} is a question about spelling and
+morphology, and string similarity answers it.
+\enquote{What travels with this} is a question about subject matter,
+and only co-occurrence answers that.
+Reporting them as two labelled sections keeps them from being confused
+for one another, because a term can rank high on either for entirely
+unrelated reasons.
+
+<<constants>>=
+TERMS_DEFAULT_LIMIT = 20
+TERM_INDEX_EMPTY_HINT = (
+    "No terms indexed yet for this site. Read some messages first, "
+    "for example with 'zulipcli read STREAM'."
+)
+@
+
+\subsection{Reading the index}
+
+Both queries are read-only, and both have to cope with an index that
+does not exist yet---the ordinary state on a fresh install.
+Opening in read-only mode makes that explicit instead of silently
+creating an empty database, which would turn \enquote{you have not read
+anything yet} into \enquote{this realm has no vocabulary}.
+
+<<functions>>=
+def _query_term_index(client, statement, parameters):
+    """Run one read-only query against the term index."""
+    path = _term_index_path(client)
+    if not path.exists():
+        return []
+
+    connection = sqlite3.connect(
+        f"file:{path}?mode=ro",
+        uri=True,
+        timeout=TERM_INDEX_TIMEOUT,
+    )
+    try:
+        return connection.execute(statement, parameters).fetchall()
+    finally:
+        connection.close()
+@
+
+We pull the whole vocabulary in one query rather than asking SQL for
+prefix matches, substring matches, and near matches separately.
+The fuzzy tier has to scan every candidate anyway, so the extra queries
+would buy nothing---and splitting the work would put half the ranking
+rules in SQL and half in Python, where they could disagree.
+
+<<functions>>=
+def _term_index_vocabulary(client, min_count):
+    """Return every indexed term and its count, most frequent first."""
+    return _query_term_index(
+        client,
+        "SELECT term, hits FROM terms WHERE hits >= ? "
+        "ORDER BY hits DESC, term",
+        (min_count,),
+    )
+@
+
+<<functions>>=
+def _term_index_cooccurrences(client, term, min_count, limit):
+    """Return the terms most often sharing a message with `term`."""
+    return _query_term_index(
+        client,
+        "SELECT other, hits FROM pairs "
+        "WHERE term = ? AND hits >= ? "
+        "ORDER BY hits DESC, other LIMIT ?",
+        (term, min_count, limit),
+    )
+@
+
+\subsection{Ranking by similarity}
+
+The score is a fixed ladder rather than one blended number: an exact
+hit outranks a prefix, a prefix outranks a substring, and only then
+does edit similarity decide.
+Blending would let a very frequent near-match displace the exact term
+the user typed, and since the co-occurrence section reports on whichever
+term ranks first, that would silently answer a question about the
+wrong word.
+Ties inside a tier fall back to frequency, so the realm's usual
+spelling comes before its rare variants.
+
+Matching one word against a whole vocabulary is what
+[[SequenceMatcher]] is built for, provided it is used the documented
+way round.
+The second sequence is the one it preprocesses, so the needle goes
+there once and each candidate is swapped into the first slot.
+Its two approximations, [[real_quick_ratio()]] and [[quick_ratio()]],
+are cheap upper bounds on the real score: if the bound already falls
+below the threshold the true ratio cannot reach it, so most of the
+vocabulary is rejected without ever running the full match.
+
+<<constants>>=
+TERM_SCORE_EXACT = 3.0
+TERM_SCORE_PREFIX = 2.0
+TERM_SCORE_SUBSTRING = 1.0
+TERM_SIMILARITY_THRESHOLD = 0.6
+<<functions>>=
+def _rank_similar_terms(vocabulary, needle, limit):
+    """Return vocabulary entries resembling `needle`, best first."""
+    matcher = difflib.SequenceMatcher(a="", b=needle)
+    scored = []
+    for term, hits in vocabulary:
+        if term == needle:
+            score = TERM_SCORE_EXACT
+        elif term.startswith(needle):
+            score = TERM_SCORE_PREFIX
+        elif needle in term:
+            score = TERM_SCORE_SUBSTRING
+        else:
+            matcher.set_seq1(term)
+            if matcher.real_quick_ratio() < TERM_SIMILARITY_THRESHOLD:
+                continue
+            if matcher.quick_ratio() < TERM_SIMILARITY_THRESHOLD:
+                continue
+            score = matcher.ratio()
+            if score < TERM_SIMILARITY_THRESHOLD:
+                continue
+        scored.append((score, hits, term))
+
+    scored.sort(key=lambda entry: (-entry[0], -entry[1], entry[2]))
+    return [(term, hits) for _, hits, term in scored[:limit]]
+@
+
+<<test functions>>=
+def test_rank_similar_terms_orders_exact_prefix_then_fuzzy():
+    vocabulary = [
+        ("kryptografi", 50),
+        ("krypto", 5),
+        ("kryptografin", 3),
+        ("dekryptera", 7),
+        ("banan", 99),
+    ]
+
+    ranked = cli._rank_similar_terms(vocabulary, "krypto", 10)
+
+    assert [term for term, _ in ranked] == [
+        "krypto",
+        "kryptografi",
+        "kryptografin",
+        "dekryptera",
+    ]
+@
+
+The tie-break matters because the whole point is to suggest the word
+this realm actually writes, not merely a word that happens to match:
+
+<<test functions>>=
+def test_rank_similar_terms_breaks_ties_by_frequency():
+    vocabulary = [("tentan", 2), ("tentamen", 40), ("tentor", 9)]
+
+    ranked = cli._rank_similar_terms(vocabulary, "tent", 10)
+
+    assert [term for term, _ in ranked] == [
+        "tentamen",
+        "tentor",
+        "tentan",
+    ]
+@
+
+<<test functions>>=
+def test_rank_similar_terms_drops_distant_words():
+    vocabulary = [("kryptografi", 50), ("banan", 99)]
+
+    ranked = cli._rank_similar_terms(vocabulary, "krypto", 10)
+
+    assert [term for term, _ in ranked] == ["kryptografi"]
+@
+
+\subsection{Reporting}
+
+Co-occurrence is reported for the single best-matching term, and the
+header names it.
+Summing the neighbours of every similar term would merge unrelated
+subjects---a query for [[krypto]] would blend the cryptography course
+with anything about cryptocurrency---and produce a list that describes
+neither.
+
+A bare invocation lists the most frequent terms instead.
+That is the cold-start case: an agent that has just arrived knows no
+words at all, and a frequency list is the shortest description of what
+this realm talks about.
+
+The empty-index message goes to stderr, and the command still succeeds.
+Stdout stays a clean stream of data rows, so a caller can pipe [[terms]]
+into another tool without having to strip an advisory line, and an
+empty vocabulary is a normal state rather than a failure.
+
+<<functions>>=
+def _print_term_rows(rows):
+    """Print term and count pairs as tab-separated lines."""
+    for term, hits in rows:
+        print(f"{term}\t{hits}")
+@
+
+<<functions>>=
+def terms_command(client, args):
+    """Report the vocabulary recorded in the local term index."""
+    vocabulary = _term_index_vocabulary(client, args.min_count)
+    if not vocabulary:
+        print(TERM_INDEX_EMPTY_HINT, file=sys.stderr)
+        return
+
+    if not args.query:
+        _print_term_rows(vocabulary[:args.limit])
+        return
+
+    similar = _rank_similar_terms(
+        vocabulary,
+        args.query.casefold(),
+        args.limit,
+    )
+    if not similar:
+        print(
+            f"No indexed term resembles {args.query!r}.",
+            file=sys.stderr,
+        )
+        return
+
+    print("similar:")
+    _print_term_rows(similar)
+
+    best = similar[0][0]
+    cooccurring = _term_index_cooccurrences(
+        client,
+        best,
+        args.min_count,
+        args.limit,
+    )
+    if cooccurring:
+        print()
+        print(f"co-occurring with {best}:")
+        _print_term_rows(cooccurring)
+@
+
+<<functions>>=
+def _terms_handler(
+    ctx: typer.Context,
+    query: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="word to look up; omit to list the most frequent",
+            autocompletion=complete_indexed_terms,
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option(
+            "--limit",
+            "-n",
+            min=1,
+            help="show at most this many rows per section",
+        ),
+    ] = TERMS_DEFAULT_LIMIT,
+    min_count: Annotated[
+        int,
+        typer.Option(
+            "--min-count",
+            min=1,
+            help="ignore terms seen fewer times than this",
+        ),
+    ] = 1,
+):
+    """Look up the vocabulary used in this Zulip realm."""
+    terms_command(
+        _get_client_from_context(ctx),
+        SimpleNamespace(
+            query=query,
+            limit=limit,
+            min_count=min_count,
+        ),
+    )
+@
+
+<<test functions>>=
+def _index_sample_vocabulary(client):
+    cli._index_messages(client, [
+        {"id": 1, "content": "kryptografi tenta"},
+        {"id": 2, "content": "kryptografi tenta"},
+        {"id": 3, "content": "kryptografi inlamning"},
+        {"id": 4, "content": "kryptovaluta bitcoin"},
+    ])
+@
+
+Let's verify the cold-start case, where a caller knows no words yet:
+
+<<test functions>>=
+def test_terms_without_query_lists_most_frequent_terms(capsys):
+    client = _make_indexing_client()
+    _index_sample_vocabulary(client)
+
+    terms_command(
+        client,
+        SimpleNamespace(query=None, limit=2, min_count=1),
+    )
+
+    assert capsys.readouterr().out == (
+        "kryptografi\t3\n"
+        "tenta\t2\n"
+    )
+@
+
+<<test functions>>=
+def test_terms_prints_similar_and_cooccurring_sections(capsys):
+    client = _make_indexing_client()
+    _index_sample_vocabulary(client)
+
+    terms_command(
+        client,
+        SimpleNamespace(query="krypto", limit=5, min_count=1),
+    )
+
+    assert capsys.readouterr().out == (
+        "similar:\n"
+        "kryptografi\t3\n"
+        "kryptovaluta\t1\n"
+        "\n"
+        "co-occurring with kryptografi:\n"
+        "tenta\t2\n"
+        "inlamning\t1\n"
+    )
+@
+
+<<test functions>>=
+def test_terms_min_count_filters_rare_terms(capsys):
+    client = _make_indexing_client()
+    _index_sample_vocabulary(client)
+
+    terms_command(
+        client,
+        SimpleNamespace(query=None, limit=10, min_count=2),
+    )
+
+    assert capsys.readouterr().out == (
+        "kryptografi\t3\n"
+        "tenta\t2\n"
+    )
+@
+
+An index that does not exist yet is an ordinary state, so it must not
+look like a failure or pollute the data stream:
+
+<<test functions>>=
+def test_terms_reports_an_empty_index_on_stderr(capsys):
+    terms_command(
+        _make_indexing_client(),
+        SimpleNamespace(query=None, limit=10, min_count=1),
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No terms indexed yet" in captured.err
+@
+
+<<test functions>>=
+def test_terms_reports_an_unknown_word_on_stderr(capsys):
+    client = _make_indexing_client()
+    _index_sample_vocabulary(client)
+
+    terms_command(
+        client,
+        SimpleNamespace(query="zzzzzzzz", limit=5, min_count=1),
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "No indexed term resembles" in captured.err
+@
+
+<<test functions>>=
+def test_terms_cli_passes_query_and_limits(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "terms_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(
+        app,
+        ["terms", "krypto", "-n", "3", "--min-count", "2"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["args"].query == "krypto"
+    assert seen["args"].limit == 3
+    assert seen["args"].min_count == 2
+@
+
+
 \section{The \texttt{bot} subcommand}
+\label{sec:bot}
 
 The old cron-driven pattern reran a helper on a timer and let that
 helper ask Zulip whether anything unread had appeared.
@@ -3381,6 +5401,69 @@ def _unread_message_ids_from_snapshot(unread_msgs):
     return message_ids
 @
 
+Every command that reads history sends the same six-key request and
+differs only in the narrow and the paging direction.
+Spelling that dictionary out at each call site invites the copies to
+drift apart, so one helper owns the constant part and callers override
+only what they actually vary.
+
+Those call sites are also where message bodies enter the program, which
+makes them the single place worth teaching about the term index of
+\cref{sec:term-index}.
+Routing every request through one fetch helper means each pagination
+loop---including ones written later---feeds the index without needing
+to know that it exists.
+We index before printing, because indexing is not acknowledgement: a
+broken pipe partway through a transcript should still leave the
+vocabulary recorded, and the rule that only printed messages are marked
+as read stays untouched.
+
+<<functions>>=
+def _history_request(narrow, **overrides):
+    """Return a get_messages request for `narrow`."""
+    request = {
+        "anchor": 0,
+        "num_before": 0,
+        "num_after": HISTORY_BATCH_SIZE,
+        "narrow": list(narrow),
+        "client_gravatar": False,
+        "apply_markdown": False,
+    }
+    request.update(overrides)
+    return request
+@
+
+<<functions>>=
+def _fetch_history_page(client, request):
+    """Return one page of history and feed the term index."""
+    result = _require_success(client.get_messages(request))
+    _index_messages_safely(client, result["messages"])
+    return result
+@
+
+Let's verify that reading really does populate the index, since that is
+the only thing that makes [[terms]] answerable:
+
+<<test functions>>=
+def test_fetch_history_page_feeds_the_term_index(monkeypatch):
+    indexed = []
+    monkeypatch.setattr(
+        cli,
+        "_index_messages_safely",
+        lambda client, messages: indexed.extend(messages),
+    )
+    client = MagicMock()
+    client.get_messages.return_value = {
+        "result": "success",
+        "found_newest": True,
+        "messages": [{"id": 1, "content": "migration"}],
+    }
+
+    cli._fetch_history_page(client, cli._history_request([]))
+
+    assert indexed == [{"id": 1, "content": "migration"}]
+@
+
 The register snapshot is capped at Zulip's most recent unread messages.
 When the server tells us older unread messages are missing, a lower-bound
 snapshot is not good enough: the bot would make rerun decisions on stale
@@ -3394,18 +5477,11 @@ queue's [[all_public_streams]] scope.
 <<functions>>=
 def _get_messages_for_narrow(client, narrow):
     """Return all messages matching `narrow` from oldest to newest."""
-    request = {
-        "anchor": 0,
-        "num_before": 0,
-        "num_after": HISTORY_BATCH_SIZE,
-        "narrow": list(narrow),
-        "client_gravatar": False,
-        "apply_markdown": False,
-    }
+    request = _history_request(narrow)
     messages = []
     found_newest = False
     while not found_newest:
-        result = _require_success(client.get_messages(request))
+        result = _fetch_history_page(client, request)
         found_newest = result["found_newest"]
         if result["messages"]:
             messages.extend(result["messages"])
@@ -4701,6 +6777,9 @@ def test_bot_resynchronizes_after_bad_event_queue_id(monkeypatch):
     client.deregister.assert_called_once_with("queue-2")
 @
 
+\section{Registering the command surface}
+\label{sec:registration}
+
 The standalone and embedded applications must expose the same command
 surface.
 We therefore register the handlers through one helper that binds the
@@ -4718,6 +6797,8 @@ def _register_commands(target: typer.Typer) -> None:
     target.command("streams")(_streams_handler)
     target.command("topics")(_topics_handler)
     target.command("read")(_read_handler)
+    target.command("search")(_search_handler)
+    target.command("terms")(_terms_handler)
     target.command(
         "bot",
         context_settings=BOT_CONTEXT_SETTINGS,
@@ -4728,6 +6809,9 @@ def _register_commands(target: typer.Typer) -> None:
 <<functions>>=
 _register_commands(app)
 @
+
+\section{The shared message-reading engine}
+\label{sec:reading-engine}
 
 The header needs to stay readable for both stream history and direct
 messages.
@@ -4792,13 +6876,29 @@ def _read_message_target(message):
     return message.get("topic") or message.get("subject", "")
 @
 
+The timestamp gains a third consumer in \cref{sec:search}, and three
+copies of one [[strftime]] call is two too many.
+Plain [[read]] output, the bot's worker payload, and a search hit have
+to agree exactly, or a tool that learns to parse one will mis-parse
+another.
+Formatting in UTC rather than local time keeps that agreement stable
+across machines and daylight-saving boundaries.
+
+<<constants>>=
+MESSAGE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+<<functions>>=
+def _format_message_timestamp(message):
+    """Return one message's UTC timestamp in the shared format."""
+    return datetime.fromtimestamp(
+        message["timestamp"],
+        timezone.utc,
+    ).strftime(MESSAGE_TIMESTAMP_FORMAT)
+@
+
 <<functions>>=
 def _write_read_message(file, message):
     """Write one message in the plain read-command format."""
-    timestamp = datetime.fromtimestamp(
-        message["timestamp"],
-        timezone.utc,
-    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = _format_message_timestamp(message)
     target = _read_message_target(message)
     print(
         f"{timestamp}\t{message['sender_full_name']}\t{target}",
@@ -4812,10 +6912,7 @@ def _write_read_message(file, message):
 def _print_read_message(message):
     """Print one message in the read command format."""
     if _stdout_is_tty():
-        timestamp = datetime.fromtimestamp(
-            message["timestamp"],
-            timezone.utc,
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        timestamp = _format_message_timestamp(message)
         target = _read_message_target(message)
         print(f"{timestamp}\t{message['sender_full_name']}\t{target}")
         _print_read_content(message["content"])
@@ -4860,19 +6957,12 @@ def _mark_message_ids_as_read(client, message_ids):
 <<functions>>=
 def _read_messages(client, narrow, *, mark_as_read):
     """Read all messages matching `narrow` from oldest to newest."""
-    request = {
-        "anchor": 0,
-        "num_before": 0,
-        "num_after": HISTORY_BATCH_SIZE,
-        "narrow": list(narrow),
-        "client_gravatar": False,
-        "apply_markdown": False,
-    }
+    request = _history_request(narrow)
 
     printed_message_ids = [] if mark_as_read else None
     found_newest = False
     while not found_newest:
-        result = _require_success(client.get_messages(request))
+        result = _fetch_history_page(client, request)
 
         found_newest = result["found_newest"]
         if result["messages"]:
@@ -5006,15 +7096,27 @@ def test_read_cli_allows_omitted_stream(monkeypatch):
 @
 
 Let's build a small helper for synthetic history payloads.
+Zulip reports a stream message's channel in [[display_recipient]], and
+\cref{sec:search} needs it to say where a hit came from, so the helper
+carries it too.
 
 <<test functions>>=
-def _make_stream_message(message_id, timestamp, sender, topic, content):
+def _make_stream_message(
+    message_id,
+    timestamp,
+    sender,
+    topic,
+    content,
+    *,
+    stream="general",
+):
     """Create a sample stream message for testing."""
     return {
         "id": message_id,
         "timestamp": timestamp,
         "sender_full_name": sender,
         "type": "stream",
+        "display_recipient": stream,
         "topic": topic,
         "content": content,
     }
@@ -5485,6 +7587,8 @@ def test_read_reports_history_errors(capsys):
         "Error: Invalid narrow operator\n"
     )
 @
+
+\section{Completion regression tests}
 
 We can also verify the remaining completion cases: topics for a selected
 stream, direct-message recipients with full-name help text, and the
