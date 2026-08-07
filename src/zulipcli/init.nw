@@ -42,18 +42,50 @@ import zulip
 DEFAULT_ZULIPRC = os.path.expanduser("~/.zuliprc")
 @
 
+An API key is the one credential worth keeping out of the filesystem
+entirely, so [[get_client]] accepts an [[api_key]] and an [[email]]
+alongside the file path.
+This works because [[zulip.Client]] resolves each field
+independently---constructor argument first, then the environment, then
+the configuration file---rather than picking a single source for the
+whole set.
+A caller may therefore supply just the key and leave the account
+address and the server URL in a [[zuliprc]] that holds no secret at
+all.
+
+Passing [[None]] is how the library spells \enquote{not specified},
+which is why both overrides default to [[None]] and are forwarded
+unconditionally: no branch is needed to tell \enquote{no override}
+apart from \enquote{override with nothing}.
+They are keyword-only because a third positional string at a call site
+would be indistinguishable from a path.
+
 <<functions>>=
-def get_client(zuliprc=None):
+def get_client(zuliprc=None, *, api_key=None, email=None):
     """Create and return a configured Zulip API client.
 
     Args:
         zuliprc: Path to a zuliprc configuration file.
-            Defaults to ``~/.zuliprc``.
+            Defaults to `~/.zuliprc`.
+        api_key: API key overriding the one in the file.
+        email: Account address overriding the one in the file.
 
     Returns:
-        A ``zulip.Client`` instance ready for API calls.
+        A `zulip.Client` instance ready for API calls.
     """
     if zuliprc is None:
         zuliprc = DEFAULT_ZULIPRC
-    return zulip.Client(config_file=zuliprc)
+    return zulip.Client(
+        config_file=zuliprc,
+        api_key=api_key,
+        email=email,
+    )
 @
+
+Because [[DEFAULT_ZULIPRC]] is substituted before the call, the library
+never sees [[config_file=None]] and so never consults its own
+[[ZULIP_CONFIG]] variable.
+That is deliberate---this package owns the question of which file to
+read, and one answer is easier to reason about than two---but it is
+worth stating, because the library documents [[ZULIP_CONFIG]] and a
+reader would otherwise expect it to take effect here.
