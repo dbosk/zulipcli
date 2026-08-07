@@ -21,8 +21,13 @@ stay flat because each speaks to a different Zulip concept:
 \begin{description}
 \item[users list] List users on the server, optionally filtered by a
   regex matched against name, Zulip email, and real (delivery) email.
-\item[users invited] List pending (unaccepted) invitations.
+\item[users invited] List pending (unaccepted) invitations, both
+  emailed ones and reusable links.
 \item[users invite] Invite one or more new users by email.
+\item[users invite-link] Create a reusable invitation link, optionally
+  scoped to a particular role and set of streams.
+\item[users revoke] Withdraw pending invitations of either kind.
+\item[users resend] Send a pending email invitation again.
 \item[send] Send a message to a stream or directly to one or more users.
 \item[dm] Read direct-message history, optionally for one conversation.
 \item[streams] List available streams.
@@ -200,19 +205,189 @@ def _get_root_zuliprc(ctx: typer.Context):
     return params.get("zuliprc")
 @
 
+\subsection{Two sets of credentials}
+\label{sec:personas}
+
+One API key is not enough to run this CLI.
+Zulip's invitation endpoints refuse bot accounts outright---the check
+is on the account \emph{kind}, and it runs before any role or
+permission check, so even a bot promoted to organisation administrator
+is turned away.
+A single credential therefore cannot both drive a bot worker and
+invite anyone.
+
+Rather than add a flag that every affected command would have to
+thread through, we name the two roles a caller can act in.
+A \emph{persona} is one such role; there are exactly two, and each
+command declares which one it needs.
+Commands that talk to ordinary endpoints take whichever persona is
+configured, preferring the human; the invitation commands insist on
+the human one.
+
+<<constants>>=
+USER_PERSONA = "user"
+BOT_PERSONA = "bot"
+@
+
+A persona is identified by a suffix on the ordinary configuration
+path, so [[~/.zuliprc.user]] sits beside [[~/.zuliprc]] and needs no
+new setting to point at it.
+We return a path only when the file exists, because a non-existent
+persona file must fall back to the plain [[zuliprc]] rather than
+become an error: the overwhelmingly common setup has one file and no
+personas at all, and that setup has to keep working untouched.
+
+<<functions>>=
+def _persona_zuliprc(persona):
+    """Return the persona's zuliprc path, if that file exists."""
+    path = Path(f"{zulipcli.DEFAULT_ZULIPRC}.{persona}")
+    return str(path) if path.exists() else None
+@
+
+An API key is the one credential that is worth keeping off the disk,
+so each persona also reads one from the environment.
+The key and the account address travel together---a key authenticates
+exactly one account---which is why the address is overridable too.
+The server URL is not: both personas live on the same Zulip server, so
+the library's own [[ZULIP_SITE]] already says it once for both.
+
+Empty is treated as unset so that clearing a variable for a single
+command, as in [[ZULIP_USER_API_KEY= zulipcli users invited]], falls
+back to the file instead of authenticating with an empty string.
+
+<<functions>>=
+def _persona_credentials(persona):
+    """Return the (api_key, email) a persona's environment supplies."""
+    prefix = f"ZULIP_{persona.upper()}"
+    return (
+        os.environ.get(f"{prefix}_API_KEY") or None,
+        os.environ.get(f"{prefix}_EMAIL") or None,
+    )
+@
+
+Whether a persona is configured turns on the API key rather than the
+address, because the key is the field that has nowhere else to come
+from.
+An address without a key still needs the file, so it tells us nothing
+about whether the persona stands on its own.
+
+<<functions>>=
+def _persona_is_configured(persona):
+    """Return whether any credential source names this persona."""
+    api_key, _ = _persona_credentials(persona)
+    return bool(api_key) or _persona_zuliprc(persona) is not None
+@
+
+Ordinary commands prefer the human persona.
+A command line is driven by a person, and a message that person sends
+should be attributed to them rather than to a bot standing in for
+them.
+Returning [[None]] when neither persona is configured is what keeps
+existing installations working: no persona means no environment
+lookup and no suffixed path, which leaves exactly the behaviour this
+CLI had before personas existed.
+
+<<functions>>=
+def _default_persona():
+    """Return the persona ordinary commands should run as."""
+    for persona in (USER_PERSONA, BOT_PERSONA):
+        if _persona_is_configured(persona):
+            return persona
+    return None
+@
+
+An explicit [[--zuliprc]] outranks a persona's own file.
+The alternative---letting the persona win---would make the flag a lie
+for the commands that have a persona, and a flag that silently does
+nothing is worse than one that occasionally selects credentials the
+caller did not think about.
+The environment overrides remain in force either way, because they
+name a field rather than a file and so compose with whichever file was
+chosen.
+
+Resolving a persona to arguments is separate from building the client
+because the two callers disagree about failure: a command reports the
+error and stops, while a completion callback has to stay silent.
+Sharing the resolution keeps completion from offering candidates that
+belong to a different account than the command it is completing.
+
+<<functions>>=
+def _persona_client_arguments(zuliprc, persona):
+    """Return the `get_client` arguments naming one persona."""
+    api_key = email = None
+    if persona is not None:
+        api_key, email = _persona_credentials(persona)
+        if zuliprc is None:
+            zuliprc = _persona_zuliprc(persona)
+    return {
+        "zuliprc": zuliprc,
+        "api_key": api_key,
+        "email": email,
+    }
+@
+
 Client construction can fail before any API call if the configured
 [[zuliprc]] path is missing or malformed.
 Those failures are still ordinary command-line errors, so we report them
 through the same [[Error: ...]] path instead of showing a traceback.
 
 <<functions>>=
-def _get_client_from_context(ctx):
-    """Create a Zulip client from the current Typer context."""
+def _client_for_persona(zuliprc, persona):
+    """Create a Zulip client for one persona, or exit with its error."""
     try:
-        return zulipcli.get_client(_get_root_zuliprc(ctx))
+        return zulipcli.get_client(
+            **_persona_client_arguments(zuliprc, persona)
+        )
     except (configparser.Error, zulip.ZulipError) as error:
         _exit_with_error(str(error))
 @
+
+That leaves three entry points for command handlers.
+Nearly every handler wants the first; the invitation commands, which
+the server would otherwise reject, ask for the second; and the [[bot]]
+worker asks for the third.
+
+<<functions>>=
+def _get_client_from_context(ctx):
+    """Create a Zulip client from the current Typer context."""
+    return _client_for_persona(
+        _get_root_zuliprc(ctx),
+        _default_persona(),
+    )
+@
+
+<<functions>>=
+def _get_user_client_from_context(ctx):
+    """Create a client for endpoints that reject bot API keys."""
+    return _client_for_persona(_get_root_zuliprc(ctx), USER_PERSONA)
+@
+
+The [[bot]] worker is the one command where preferring the human would
+work against the command's stated purpose: it polls unread messages,
+feeds them to an external process, and marks them read, and doing that
+to the \emph{owner's} mailbox because a user key happened to be
+configured would be an unpleasant surprise.
+So it never falls back to the human persona: the bot persona when
+configured, otherwise the plain [[zuliprc]]---which is exactly what
+the command used before personas existed.
+
+<<functions>>=
+def _get_bot_client_from_context(ctx):
+    """Create a client for the bot worker, never as the human."""
+    persona = (
+        BOT_PERSONA if _persona_is_configured(BOT_PERSONA) else None
+    )
+    return _client_for_persona(_get_root_zuliprc(ctx), persona)
+@
+
+There is deliberately no [[--user-zuliprc]] option to match.
+Root options belong to whichever application owns the command line,
+and the embedded form below declares none at all so a host application
+can own them; adding one here would either break that contract or
+leave the two forms with different option sets.
+A caller who needs a one-off override already has [[--zuliprc]].
+
+\subsection{The embedded application}
 
 The standalone and embedded applications share the same command
 handlers.
@@ -299,11 +474,22 @@ option or a host application's callback, and the active command context
 already contains the selected stream for [[read TOPIC]] and
 [[send --topic TOPIC]].
 
+Completion resolves the same default persona that ordinary commands
+do (\cref{sec:personas}), so the streams and users offered are the
+ones an ordinary command would see.
+The invitation commands can differ---they insist on the human
+persona---but a candidate the human cannot see merely fails
+validation at the server, which is the same outcome as typing the
+name by hand.
+
 <<functions>>=
 def _get_completion_client(ctx: typer.Context):
     """Create a Zulip client for shell completion lookups."""
     try:
-        return zulipcli.get_client(_get_root_zuliprc(ctx))
+        return zulipcli.get_client(**_persona_client_arguments(
+            _get_root_zuliprc(ctx),
+            _default_persona(),
+        ))
     except Exception:
         return None
 @
@@ -498,10 +684,10 @@ from types import SimpleNamespace
 
 import pytest
 import typer
-from click.shell_completion import _resolve_context, _resolve_incomplete
+from typer._completion_classes import BashComplete
 from typer.main import get_command
 from typer.testing import CliRunner
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import zulipcli.cli as cli
 from zulipcli.cli import (
@@ -519,8 +705,11 @@ from zulipcli.cli import (
     terms_command,
     topics_command,
     users_invite_command,
+    users_invite_link_command,
     users_invited_command,
     users_list_command,
+    users_resend_command,
+    users_revoke_command,
 )
 
 runner = CliRunner()
@@ -528,15 +717,35 @@ runner = CliRunner()
 <<test functions>>
 @
 
+Running the bare command lists the subcommands, which is what
+[[no_args_is_help]] buys us.
+Typer treats \enquote{no command given} as a usage error and exits
+[[2]] rather than [[0]]; we assert that rather than work around it,
+because the alternative is overriding framework behaviour to change a
+status code nobody branches on, and pinning it here means a future
+Typer that changes its mind says so out loud.
+
 <<test functions>>=
 def test_cli_shows_help_without_command():
     result = runner.invoke(app, [])
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert "Commands" in result.output
     assert "bot" in result.output
     assert "read" in result.output
     assert "search" in result.output
     assert "terms" in result.output
+@
+
+The subcommand groups behave the same way, and the invitation verbs
+have to be reachable from the listing for anyone to discover them.
+
+<<test functions>>=
+def test_users_help_lists_the_invitation_verbs():
+    result = runner.invoke(app, ["users"])
+
+    for verb in ("invited", "invite", "invite-link", "revoke",
+                 "resend"):
+        assert verb in result.output
 @
 
 <<test functions>>=
@@ -548,7 +757,7 @@ def test_cli_passes_zuliprc_to_commands(monkeypatch):
     }
     seen = {}
 
-    def get_client(zuliprc=None):
+    def get_client(zuliprc=None, **kwargs):
         seen["zuliprc"] = zuliprc
         return client
 
@@ -563,7 +772,7 @@ def test_cli_passes_zuliprc_to_commands(monkeypatch):
 
 <<test functions>>=
 def test_cli_reports_missing_zuliprc_without_traceback(monkeypatch):
-    def get_client(zuliprc=None):
+    def get_client(zuliprc=None, **kwargs):
         raise cli.zulip.ConfigNotFoundError(
             "api_key or email not specified and file "
             "/tmp/missing.zuliprc does not exist"
@@ -593,7 +802,7 @@ def test_embedded_app_mounts_under_custom_name(monkeypatch):
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     parent = typer.Typer()
@@ -625,7 +834,7 @@ def test_embedded_app_reads_zuliprc_from_parent_ctx_obj(monkeypatch):
     }
     seen = {}
 
-    def get_client(zuliprc=None):
+    def get_client(zuliprc=None, **kwargs):
         seen["zuliprc"] = zuliprc
         return client
 
@@ -676,6 +885,247 @@ def test_standalone_callback_preserves_existing_ctx_obj():
     assert ctx.obj["zuliprc"] is None
 @
 
+Persona resolution reads the real environment and the real home
+directory, so a developer who exports [[ZULIP_USER_API_KEY]] would
+otherwise see different results than a clean checkout.
+One autouse fixture clears both personas and relocates the
+configuration path, making isolation the default rather than something
+each test has to remember.
+Relocating [[DEFAULT_ZULIPRC]] rather than [[Path.home]] is what
+actually works here: the constant is computed once at import time, so
+patching the home directory afterwards would come too late.
+
+<<test functions>>=
+@pytest.fixture(autouse=True)
+def isolated_personas(tmp_path, monkeypatch):
+    for persona in ("USER", "BOT"):
+        monkeypatch.delenv(f"ZULIP_{persona}_API_KEY", raising=False)
+        monkeypatch.delenv(f"ZULIP_{persona}_EMAIL", raising=False)
+    monkeypatch.setattr(
+        cli.zulipcli,
+        "DEFAULT_ZULIPRC",
+        str(tmp_path / ".zuliprc"),
+    )
+    return tmp_path
+@
+
+Most persona assertions are about which arguments reach
+[[get_client]], so one helper captures them.
+
+<<test functions>>=
+def _record_get_client(monkeypatch):
+    """Capture the arguments the next client construction receives."""
+    seen = {}
+
+    def get_client(zuliprc=None, *, api_key=None, email=None):
+        seen.update(zuliprc=zuliprc, api_key=api_key, email=email)
+        return MagicMock()
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+    return seen
+@
+
+A persona whose file exists is used without any further configuration.
+
+<<test functions>>=
+def test_persona_client_uses_the_persona_file(monkeypatch, tmp_path):
+    (tmp_path / ".zuliprc.user").write_text("[api]\n")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona(None, cli.USER_PERSONA)
+
+    assert seen["zuliprc"] == str(tmp_path / ".zuliprc.user")
+@
+
+An explicit path wins even when the persona has a file of its own,
+which is what keeps [[--zuliprc]] honest.
+
+<<test functions>>=
+def test_persona_client_prefers_an_explicit_zuliprc(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / ".zuliprc.user").write_text("[api]\n")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona("/tmp/explicit.zuliprc", cli.USER_PERSONA)
+
+    assert seen["zuliprc"] == "/tmp/explicit.zuliprc"
+@
+
+The environment overrides individual fields rather than the file, so a
+key supplied this way arrives alongside whichever path was chosen.
+
+<<test functions>>=
+def test_persona_client_forwards_environment_credentials(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+    monkeypatch.setenv("ZULIP_USER_EMAIL", "me@example.com")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona(None, cli.USER_PERSONA)
+
+    assert seen["api_key"] == "secret"
+    assert seen["email"] == "me@example.com"
+@
+
+<<test functions>>=
+def test_persona_client_treats_empty_variables_as_unset(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona(None, cli.USER_PERSONA)
+
+    assert seen["api_key"] is None
+@
+
+Without a persona nothing is consulted, which is the compatibility
+guarantee: an installation that predates personas keeps behaving
+exactly as it did.
+
+<<test functions>>=
+def test_no_persona_leaves_the_credentials_alone(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona(None, None)
+
+    assert seen == {
+        "zuliprc": None,
+        "api_key": None,
+        "email": None,
+    }
+@
+
+The human persona wins when both are configured, and either one alone
+is enough to be selected.
+
+<<test functions>>=
+def test_default_persona_prefers_the_user(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+    monkeypatch.setenv("ZULIP_BOT_API_KEY", "other")
+
+    assert cli._default_persona() == cli.USER_PERSONA
+@
+
+<<test functions>>=
+def test_default_persona_falls_back_to_the_bot(monkeypatch):
+    monkeypatch.setenv("ZULIP_BOT_API_KEY", "other")
+
+    assert cli._default_persona() == cli.BOT_PERSONA
+@
+
+<<test functions>>=
+def test_default_persona_is_none_without_configuration():
+    assert cli._default_persona() is None
+@
+
+A persona file counts as configuration even with nothing in the
+environment.
+
+<<test functions>>=
+def test_a_persona_file_alone_configures_the_persona(tmp_path):
+    (tmp_path / ".zuliprc.bot").write_text("[api]\n")
+
+    assert cli._default_persona() == cli.BOT_PERSONA
+@
+
+The deliberate absence of a per-persona root option is recorded as a
+test, so a future reader sees it as a decision rather than an
+oversight.
+
+<<test functions>>=
+def test_no_persona_zuliprc_option_is_declared():
+    options = {
+        option
+        for form in (app, cli.build_embedded_app())
+        for param in get_command(form).params
+        for option in getattr(param, "opts", [])
+    }
+
+    assert "--user-zuliprc" not in options
+    assert "--bot-zuliprc" not in options
+@
+
+The [[bot]] worker must never end up with the human's credentials,
+even when only the human persona is configured---that is the case
+where the uniform default would silently consume the owner's unreads.
+
+<<test functions>>=
+def test_bot_client_never_uses_the_user_persona(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+    seen = _record_get_client(monkeypatch)
+
+    cli._get_bot_client_from_context(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+    )
+
+    assert seen["api_key"] is None
+@
+
+<<test functions>>=
+def test_bot_client_uses_the_bot_persona(monkeypatch):
+    monkeypatch.setenv("ZULIP_BOT_API_KEY", "bot-secret")
+    seen = _record_get_client(monkeypatch)
+
+    cli._get_bot_client_from_context(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
+    )
+
+    assert seen["api_key"] == "bot-secret"
+@
+
+Finally, the wiring itself: which persona a command resolves is decided
+by which client helper its handler calls, and nothing so far pins that
+choice.
+The same harness runs two commands and only the command varies, so the
+persona is the one difference the pair exposes---an invitation command
+must insist on the human, and an ordinary command must take the
+default.
+
+<<test functions>>=
+def test_invitation_commands_demand_the_user_persona(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "users_invited_command",
+        lambda client, args: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_client_for_persona",
+        lambda zuliprc, persona:
+            seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, ["users", "invited"])
+
+    assert result.exit_code == 0
+    assert seen["persona"] == cli.USER_PERSONA
+@
+
+<<test functions>>=
+def test_ordinary_commands_use_the_default_persona(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "streams_command",
+        lambda client, args: None,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_client_for_persona",
+        lambda zuliprc, persona:
+            seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, ["streams"])
+
+    assert result.exit_code == 0
+    assert seen["persona"] is None
+@
+
 <<test functions>>=
 def test_stream_completion_uses_zuliprc_override(monkeypatch):
     client = MagicMock()
@@ -685,7 +1135,7 @@ def test_stream_completion_uses_zuliprc_override(monkeypatch):
     }
     seen = {}
 
-    def get_client(zuliprc=None):
+    def get_client(zuliprc=None, **kwargs):
         seen["zuliprc"] = zuliprc
         return client
 
@@ -710,7 +1160,7 @@ def test_stream_completion_silently_ignores_lookup_errors(monkeypatch):
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
     assert complete_stream_names(
         SimpleNamespace(find_root=lambda: SimpleNamespace(params={})),
@@ -723,12 +1173,16 @@ def test_stream_completion_silently_ignores_lookup_errors(monkeypatch):
 \label{sec:users}
 
 User administration is the primary motivation for this tool, and a
-typical workflow chains three related questions: who is on the
-server, who has been invited but not yet joined, and how do I invite
-someone new?
+typical workflow chains related questions: who is on the server, who
+has been invited but not yet joined, how do I invite someone new, and
+how do I take an invitation back?
 Grouping those verbs under a single [[users]] command family keeps
 the top-level namespace tidy and makes the relationship obvious from
 the help output.
+The invitation verbs form a lifecycle of their own---create, list,
+revoke, resend---and share both a credential requirement
+(\cref{sec:invite-refusal}) and a way of naming what they act on
+(\cref{sec:invite-selection}).
 The flat verbs that follow ([[send]], [[dm]], [[streams]], [[topics]],
 [[read]], [[bot]]) each speak to a different Zulip concept and do not
 gain anything from further nesting.
@@ -742,7 +1196,7 @@ discovery and as a migration signal for anyone still typing the flat
 
 <<applications>>=
 users_app = typer.Typer(
-    help="List, invite, and inspect users on the server.",
+    help="List and inspect users, and manage invitations.",
     no_args_is_help=True,
 )
 @
@@ -1143,29 +1597,257 @@ def test_users_list_include_bots(capsys):
 @
 
 
+\subsection{When the invitation API refuses a bot}
+\label{sec:invite-refusal}
+
+Every command in the rest of this section talks to Zulip's invitation
+API, and that API accepts only human accounts
+(\cref{sec:personas}).
+The refusal arrives as an ordinary error result rather than anything
+structurally distinct, so the only thing that identifies it is a
+phrase in the message.
+
+<<constants>>=
+BOT_REQUEST_MARKER = "does not accept bot requests"
+@
+
+Matching on a message string is fragile, and we accept that
+deliberately: when the phrase stops matching, the caller still sees
+the server's own wording, merely without the extra sentence.
+The failure mode of guessing wrong is a missing hint, not a wrong one.
+
+What makes the hint worth the fragility is that the server's message
+diagnoses the wrong thing.
+It reports that this endpoint refuses bots, which is true and
+useless---the reader already believes their credentials are fine.
+The actionable part is that a second set of credentials exists and
+which knob selects it.
+
+<<functions>>=
+def _invite_error_message(message):
+    """Augment a bot-rejection message with the credential hint."""
+    if BOT_REQUEST_MARKER not in message:
+        return message
+    return (
+        f"{message} The invitation API accepts only human accounts; "
+        "put a human account's credentials in ~/.zuliprc.user or "
+        "ZULIP_USER_API_KEY, or pass --zuliprc."
+    )
+@
+
+The wrapper exists rather than a [[hint]] parameter on
+[[_require_success]] because the knowledge being recorded is not
+\enquote{this call might want extra advice} but \enquote{this endpoint
+rejects bot credentials}.
+A separate name states that at every call site, and leaves the forty
+or so ordinary [[_require_success]] calls with nothing new to decide.
+
+<<functions>>=
+def _require_invite_success(result):
+    """Return a successful invitation result or exit with its error."""
+    if result.get("result") != "success":
+        _exit_with_error(_invite_error_message(
+            result.get("msg", "unknown Zulip API error")
+        ))
+    return result
+@
+
+Let's verify that the hint is added only when it applies, so an
+unrelated failure is not padded with advice about credentials that
+were never the problem.
+
+<<test functions>>=
+def test_invite_error_message_adds_the_credential_hint():
+    message = cli._invite_error_message(
+        "This endpoint does not accept bot requests."
+    )
+
+    assert "does not accept bot requests" in message
+    assert "ZULIP_USER_API_KEY" in message
+@
+
+<<test functions>>=
+def test_invite_error_message_passes_other_messages_through():
+    message = "Must be an organization administrator"
+
+    assert cli._invite_error_message(message) == message
+@
+
+<<test functions>>=
+def test_require_invite_success_exits_with_the_hint(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli._require_invite_success({
+            "result": "error",
+            "msg": "This endpoint does not accept bot requests.",
+        })
+
+    assert excinfo.value.code == 1
+    assert "ZULIP_USER_API_KEY" in capsys.readouterr().err
+@
+
+
+\subsection{Reading an invitation record}
+\label{sec:invite-records}
+
+Zulip has two kinds of invitation and returns both from the same
+listing endpoint.
+One names a single email address; the other is a reusable link that
+anyone can redeem.
+They are distinguished by [[is_multiuse]], and---this is the part that
+bites---they do not share a key that identifies them: an email
+invitation has an [[email]] and no [[link_url]], and a link has a
+[[link_url]] and no [[email]].
+Reading either field directly therefore fails on half the records.
+
+We consult [[link_url]] when [[is_multiuse]] is absent so that a
+server which omits the flag still classifies correctly, rather than
+silently treating every link as an email invitation and then
+addressing it at the wrong endpoint.
+
+<<functions>>=
+def _invite_is_multiuse(invite):
+    """Return whether an invitation record is a reusable link."""
+    return bool(invite.get("is_multiuse", "link_url" in invite))
+@
+
+The two kinds do share a purpose, though: each has one string that
+identifies it to a person.
+Collapsing that difference into a single accessor is what lets the
+listing, the filters, and the confirmation prompts treat both kinds
+uniformly instead of branching in five places.
+
+<<functions>>=
+def _invite_handle(invite):
+    """Return the text identifying an invitation to a human."""
+    if _invite_is_multiuse(invite):
+        return invite.get("link_url", "")
+    return invite.get("email", "")
+@
+
+Addressing one invitation is where the two kinds genuinely diverge.
+The two kinds live in separate server-side tables, so their [[id]]
+values are drawn from separate sequences and an [[id]] alone is
+ambiguous---the same number can name one of each.
+The guard is to never carry an [[id]] on its own: the whole record
+travels from the listing to the request, and the endpoint is derived
+from it at the last moment.
+
+<<functions>>=
+def _invite_endpoint(invite):
+    """Return the API path naming one invitation."""
+    if _invite_is_multiuse(invite):
+        return f"invites/multiuse/{invite['id']}"
+    return f"invites/{invite['id']}"
+@
+
+Sorting puts email invitations before links and orders each group by
+its handle.
+Grouping by kind matters more than one global alphabetical order
+because the two kinds answer different questions---who has not joined
+yet, versus which links are outstanding---and a reader scanning for
+one does not want the other interleaved.
+
+<<functions>>=
+def _invite_sort_key(invite):
+    """Order email invitations before links, each by handle."""
+    return (_invite_is_multiuse(invite), _invite_handle(invite))
+@
+
+Every invitation command starts from the same listing request, so it
+lives in one place.
+
+<<functions>>=
+def _fetch_invitations(client):
+    """Return every pending invitation record."""
+    return _require_invite_success(client.call_endpoint(
+        url="invites",
+        method="GET",
+    )).get("invites", [])
+@
+
+A shared fixture gives the invitation tests both kinds at once, and
+deliberately reuses the [[id]] [[7]] for one of each so that the
+collision described above is present in every test that touches it.
+
+<<test functions>>=
+def _make_invitations():
+    """Return pending invitations of both kinds, with colliding ids."""
+    return {
+        "result": "success",
+        "invites": [
+            {
+                "id": 7,
+                "email": "newcomer@example.com",
+                "expiry_date": 0,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+                "is_multiuse": False,
+            },
+            {
+                "id": 8,
+                "email": "forever@example.com",
+                "expiry_date": None,
+                "invited_as": 600,
+                "invited_by_user_id": 5,
+                "is_multiuse": False,
+            },
+            {
+                "id": 7,
+                "link_url": "https://chat.example.com/join/abc/",
+                "expiry_date": None,
+                "invited_as": 400,
+                "invited_by_user_id": 5,
+                "is_multiuse": True,
+            },
+        ],
+    }
+@
+
+Let's verify the classification, including the fallback for a record
+that carries no [[is_multiuse]] flag at all.
+
+<<test functions>>=
+def test_invite_kind_is_read_from_the_flag():
+    email_invite, _, link = _make_invitations()["invites"]
+
+    assert not cli._invite_is_multiuse(email_invite)
+    assert cli._invite_is_multiuse(link)
+@
+
+<<test functions>>=
+def test_invite_kind_falls_back_to_the_link_url():
+    assert cli._invite_is_multiuse({"link_url": "https://x/join/a/"})
+    assert not cli._invite_is_multiuse({"email": "a@example.com"})
+@
+
+The endpoint has to disambiguate the colliding ids, which is the whole
+reason the record rather than the id is carried around.
+
+<<test functions>>=
+def test_invite_endpoint_distinguishes_colliding_ids():
+    email_invite, _, link = _make_invitations()["invites"]
+
+    assert email_invite["id"] == link["id"]
+    assert cli._invite_endpoint(email_invite) == "invites/7"
+    assert cli._invite_endpoint(link) == "invites/multiuse/7"
+@
+
+
 \subsection{Listing pending invitations: \texttt{users invited}}
 
-Pending invitations are the mirror image of [[users list]]: email
-addresses that have received an invitation link but not yet redeemed
-it.
+Pending invitations are the mirror image of [[users list]]: outstanding
+offers to join that nobody has redeemed yet.
 The [[zulip]] Python library exposes no dedicated invitation method,
 so we reach for the escape hatch that the library itself uses
 internally when a helper is missing:
 [[client.call_endpoint(url="invites", method="GET")]].
 
-The API requires organisation-administrator privileges, so a
-non-admin caller will see [[Error: Must be an organization
-administrator]] on stderr rather than a traceback; that path reuses
-our existing [[_require_success]] helper unchanged.
-
-Each invitation record carries an [[email]], an [[expiry_date]]
-(Unix seconds, or [[None]] for never-expiring links), an
-[[invited_as]] role code, and an [[invited_by_user_id]].
-We format each row as four tab-separated columns, translate the
-expiry to ISO-8601 UTC, and map the role code back to its label so
-scripts never have to memorise Zulip's integers.
-An empty invitation list prints nothing, matching the silent
-\enquote{no results} convention already used by [[users list]].
+Both kinds of invitation come back from that one request, so the
+listing shows both (\cref{sec:invite-records}).
+A filter matches whichever string identifies the record, which means
+an email regex selects email invitations and a fragment of a URL
+selects links---without the caller having to say which kind they
+meant.
 
 <<functions>>=
 @users_app.command("invited")
@@ -1174,26 +1856,24 @@ def _users_invited_handler(
     patterns: Annotated[
         Optional[list[str]],
         typer.Argument(
-            help="filter invitations by invitee email "
+            help="filter invitations by invitee email or link URL "
                  "(regex; repeat to OR several)",
         ),
     ] = None,
 ):
     """List pending (unaccepted) invitations."""
     users_invited_command(
-        _get_client_from_context(ctx),
+        _get_user_client_from_context(ctx),
         SimpleNamespace(patterns=patterns),
     )
 @
 
+An empty invitation list prints nothing, matching the silent
+\enquote{no results} convention already used by [[users list]].
+
 <<functions>>=
 def users_invited_command(client, args):
     """List pending invitations, optionally filtered by regexes."""
-    result = _require_success(client.call_endpoint(
-        url="invites",
-        method="GET",
-    ))
-
     pattern_strs = getattr(
         args,
         "patterns",
@@ -1201,18 +1881,27 @@ def users_invited_command(client, args):
     )
     patterns = _compile_patterns(pattern_strs)
 
-    for invite in sorted(result.get("invites", []),
-                         key=lambda inv: inv["email"]):
-        if not _matches_patterns([invite["email"]], patterns):
+    for invite in sorted(_fetch_invitations(client),
+                         key=_invite_sort_key):
+        if not _matches_patterns([_invite_handle(invite)], patterns):
             continue
         print(_format_invitation_row(invite))
 @
 
-Expiry formatting has two shapes to handle.
+A row is four tab-separated columns: the handle, the expiry as
+ISO-8601 UTC, the role label rather than Zulip's integer, and the
+inviter.
+Expiry has two shapes to handle.
 [[None]] represents a never-expiring invitation and prints the empty
-string so downstream [[cut -f]] callers still see four fields; an
-integer is a Unix timestamp and renders as UTC ISO-8601 to match the
-format already produced by the [[read]] command.
+string so downstream [[cut -f]] callers still see the same four field
+positions; an integer is a Unix timestamp and renders as UTC ISO-8601
+to match the format already produced by the [[read]] command.
+
+Holding the column count at four is what keeps that promise intact now
+that links appear too.
+A link has no email address to put in the first column, so it prints
+its URL there instead---the column means \enquote{whatever names this
+invitation}, and every existing [[cut -f1]] caller keeps working.
 
 <<functions>>=
 def _format_invitation_row(invite):
@@ -1228,16 +1917,102 @@ def _format_invitation_row(invite):
     role_code = invite.get("invited_as")
     role_label = _INVITE_ROLE_LABELS.get(role_code, str(role_code))
     inviter = invite.get("invited_by_user_id", "")
-    return f"{invite['email']}\t{expiry_iso}\t{role_label}\t{inviter}"
+    handle = _invite_handle(invite)
+    return f"{handle}\t{expiry_iso}\t{role_label}\t{inviter}"
 @
 
-Let's verify the success path with two rows: one dated, one that
-never expires.
-We sort by email so the assertion is stable even if Zulip's server
-order ever changes.
+Let's verify the success path with both kinds present: a dated email
+invitation, one that never expires, and a link.
+Sorting is by kind and then by handle, so the assertion is stable even
+if Zulip's server order ever changes.
 
 <<test functions>>=
 def test_users_invited_lists_pending(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    users_invited_command(
+        client,
+        SimpleNamespace(pattern=None),
+    )
+
+    assert capsys.readouterr().out.strip().split("\n") == [
+        "forever@example.com\t\tguest\t5",
+        "newcomer@example.com\t1970-01-01T00:00:00+00:00\tmember\t5",
+        "https://chat.example.com/join/abc/\t\tmember\t5",
+    ]
+    client.call_endpoint.assert_called_once_with(
+        url="invites",
+        method="GET",
+    )
+@
+
+A link record has no [[email]] key at all, so the listing used to fail
+with a [[KeyError]] the moment anyone created one through the web
+interface.
+This pins the fix.
+
+<<test functions>>=
+def test_users_invited_lists_links_without_an_email_key(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invites": [
+            {
+                "id": 3,
+                "link_url": "https://chat.example.com/join/xyz/",
+                "expiry_date": None,
+                "invited_as": 600,
+                "invited_by_user_id": 5,
+                "is_multiuse": True,
+            },
+        ],
+    }
+
+    users_invited_command(client, SimpleNamespace(patterns=None))
+
+    assert capsys.readouterr().out == (
+        "https://chat.example.com/join/xyz/\t\tguest\t5\n"
+    )
+@
+
+Every row keeps exactly four fields, whichever kind it describes.
+
+<<test functions>>=
+def test_users_invited_always_prints_four_columns(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    users_invited_command(client, SimpleNamespace(patterns=None))
+
+    for row in capsys.readouterr().out.strip().split("\n"):
+        assert len(row.split("\t")) == 4
+@
+
+A URL fragment selects a link, which is how [[users revoke]] will name
+one later.
+
+<<test functions>>=
+def test_users_invited_matches_a_link_by_its_url(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    users_invited_command(
+        client,
+        SimpleNamespace(patterns=["join/abc"]),
+    )
+
+    assert capsys.readouterr().out == (
+        "https://chat.example.com/join/abc/\t\tmember\t5\n"
+    )
+@
+
+A server that omits [[is_multiuse]] altogether must still render
+correctly, which exercises the [[link_url]] fallback from the other
+direction: no flag and no URL means an email invitation.
+
+<<test functions>>=
+def test_users_invited_handles_records_without_the_flag(capsys):
     client = MagicMock()
     client.call_endpoint.return_value = {
         "result": "success",
@@ -1256,19 +2031,16 @@ def test_users_invited_lists_pending(capsys):
             },
         ],
     }
+
     users_invited_command(
         client,
         SimpleNamespace(pattern=None),
     )
-    output = capsys.readouterr().out.strip().split("\n")
-    assert output == [
+
+    assert capsys.readouterr().out.strip().split("\n") == [
         "forever@example.com\t\tguest\t5",
         "newcomer@example.com\t1970-01-01T00:00:00+00:00\tmember\t5",
     ]
-    client.call_endpoint.assert_called_once_with(
-        url="invites",
-        method="GET",
-    )
 @
 
 <<test functions>>=
@@ -1381,9 +2153,8 @@ def test_users_invited_reports_permission_error(capsys):
 
 Creating an invitation is a [[POST]] to the same [[invites]]
 endpoint.
-The API requires at least one invitee email; the rest---role,
-expiration, and pre-subscribed streams---have server-side defaults
-that most callers accept.
+The API requires at least one invitee email; role, expiration, and
+pre-subscribed streams are all optional.
 We expose the full option set from day one so an operator onboarding
 a cohort can set role and starting streams in a single call rather
 than accepting a default and editing it afterwards through the web
@@ -1405,14 +2176,18 @@ class InviteRole(str, Enum):
     guest = "guest"
 @
 
-The option name [[--as]] reads naturally (\enquote{invite Alice as
-admin}) but [[as]] is a Python keyword, so the parameter name has to
-be [[invite_as]] and the CLI alias is wired explicitly.
-
 The [[EMAIL...]] positional argument has no autocompletion because
 the target addresses are, by construction, not yet users of the
 server; completing from the member list would be actively
 misleading.
+
+Everything except the recipients is shared with the link-creating verb
+introduced below, and Typer reads its options from the function
+signature, so there is no way to share them as a value.
+We share them as source text instead: one chunk defines the options
+and another passes them on, and both verbs reference the pair.
+That is what keeps a change to the role help text or the completion
+callback from silently applying to only one of the two commands.
 
 <<functions>>=
 @users_app.command("invite")
@@ -1424,42 +2199,65 @@ def _users_invite_handler(
             help="email addresses to invite",
         ),
     ],
-    invite_as: Annotated[
-        InviteRole,
-        typer.Option(
-            "--as",
-            "-a",
-            help="organisation role assigned to invitees",
-        ),
-    ] = InviteRole.member,
-    expires_in: Annotated[
-        Optional[int],
-        typer.Option(
-            "--expires-in",
-            help="invitation expiry in minutes "
-                 "(default: server policy)",
-        ),
-    ] = None,
-    streams: Annotated[
-        Optional[list[str]],
-        typer.Option(
-            "--stream",
-            "-s",
-            help="stream to subscribe invitees to (repeatable)",
-            autocompletion=complete_stream_names,
-        ),
-    ] = None,
+    <<invitation options>>
 ):
     """Invite one or more users to the Zulip organisation."""
     users_invite_command(
-        _get_client_from_context(ctx),
+        _get_user_client_from_context(ctx),
         SimpleNamespace(
             emails=emails,
-            invite_as=invite_as,
-            expires_in=expires_in,
-            streams=list(streams or []),
+            <<invitation arguments>>
         ),
     )
+@
+
+The option name [[--as]] reads naturally but [[as]] is a Python
+keyword, so the parameter has to be [[invite_as]] and the alias is
+wired explicitly.
+[[--add-default-streams]] needs no such wiring: Typer derives the
+paired [[--no-add-default-streams]] form from any boolean parameter,
+which is the same treatment [[--include-bots]] already gets.
+
+<<invitation options>>=
+invite_as: Annotated[
+    InviteRole,
+    typer.Option(
+        "--as",
+        "-a",
+        help="organisation role assigned to invitees",
+    ),
+] = InviteRole.member,
+expires_in: Annotated[
+    Optional[int],
+    typer.Option(
+        "--expires-in",
+        help="invitation expiry in minutes "
+             "(default: server policy)",
+    ),
+] = None,
+streams: Annotated[
+    Optional[list[str]],
+    typer.Option(
+        "--stream",
+        "-s",
+        help="stream to subscribe invitees to (repeatable)",
+        autocompletion=complete_stream_names,
+    ),
+] = None,
+add_default_streams: Annotated[
+    bool,
+    typer.Option(
+        help="also subscribe invitees to the organisation's "
+             "default streams",
+    ),
+] = True,
+@
+
+<<invitation arguments>>=
+invite_as=invite_as,
+expires_in=expires_in,
+streams=list(streams or []),
+add_default_streams=add_default_streams,
 @
 
 Stream subscriptions require numeric IDs, not names, so we resolve
@@ -1467,35 +2265,61 @@ each requested stream before building the request.
 Resolving up-front means an unknown stream name aborts with a clear
 [[Error: Invalid channel name ...]] \emph{before} any invitation is
 sent, rather than after a partial success.
+Both invitation verbs need this, so it is a function rather than a
+loop inlined twice.
+
+<<functions>>=
+def _resolve_stream_ids(client, stream_names):
+    """Resolve stream names to the numeric IDs the API wants."""
+    return [
+        _require_success(client.get_stream_id(name))["stream_id"]
+        for name in stream_names or []
+    ]
+@
 
 The [[invitee_emails]] field accepts both comma-separated and
 newline-separated strings; we prefer newlines because commas inside
 display names or anti-spam quoting would otherwise have to be
 escaped manually.
 
-Omitting [[invite_expires_in_minutes]] and [[stream_ids]] from the
-request when the user did not ask for them lets the server apply its
-own defaults rather than forcing an empty list to mean
-\enquote{subscribe to nothing}.
+There is one server default that must not be accepted quietly.
+[[stream_ids]] defaults to the empty list and
+[[include_realm_default_subscriptions]] defaults to false, so an
+invitation that says nothing about streams subscribes the newcomer to
+\emph{nothing at all}---not to the organisation's default streams, as
+one would reasonably assume.
+Landing someone in an empty server is almost never what the caller
+meant, so [[--add-default-streams]] is on unless it is switched off.
+
+That also makes [[--stream]] behave the way the option name suggests
+in both directions: on its own it adds to the defaults, and paired
+with [[--no-add-default-streams]] it specifies the subscription set
+exactly.
+The latter is what makes one link per cohort possible---a
+guest link for one course and another for a second course, each
+seeing only its own streams.
+
+[[invite_expires_in_minutes]] is still omitted when unset, because
+there the server's own default (ten days) is a real policy worth
+deferring to.
 
 <<functions>>=
 def users_invite_command(client, args):
     """Create invitations for the given emails."""
-    stream_ids = [
-        _require_success(client.get_stream_id(name))["stream_id"]
-        for name in args.streams
-    ]
+    stream_ids = _resolve_stream_ids(client, args.streams)
 
     request = {
         "invitee_emails": "\n".join(args.emails),
         "invite_as": _INVITE_ROLE_CODES[args.invite_as.value],
+        "include_realm_default_subscriptions":
+            args.add_default_streams,
     }
     if args.expires_in is not None:
         request["invite_expires_in_minutes"] = args.expires_in
     if stream_ids:
         request["stream_ids"] = stream_ids
 
-    _require_success(client.call_endpoint(
+    _require_invite_success(client.call_endpoint(
         url="invites",
         method="POST",
         request=request,
@@ -1517,6 +2341,7 @@ def test_users_invite_sends_minimal_request():
             invite_as=InviteRole.member,
             expires_in=None,
             streams=[],
+            add_default_streams=True,
         ),
     )
 
@@ -1526,6 +2351,7 @@ def test_users_invite_sends_minimal_request():
         request={
             "invitee_emails": "new@example.com",
             "invite_as": 400,
+            "include_realm_default_subscriptions": True,
         },
     )
     client.get_stream_id.assert_not_called()
@@ -1551,6 +2377,7 @@ def test_users_invite_resolves_streams_and_role():
             invite_as=InviteRole.admin,
             expires_in=1440,
             streams=["general", "random"],
+            add_default_streams=False,
         ),
     )
 
@@ -1560,6 +2387,7 @@ def test_users_invite_resolves_streams_and_role():
         request={
             "invitee_emails": "one@example.com\ntwo@example.com",
             "invite_as": 200,
+            "include_realm_default_subscriptions": False,
             "invite_expires_in_minutes": 1440,
             "stream_ids": [7, 11],
         },
@@ -1584,6 +2412,7 @@ def test_users_invite_reports_unknown_stream(capsys):
                 invite_as=InviteRole.member,
                 expires_in=None,
                 streams=["missing"],
+                add_default_streams=True,
             ),
         )
 
@@ -1613,6 +2442,7 @@ def test_users_invite_reports_permission_error(capsys):
                 invite_as=InviteRole.member,
                 expires_in=None,
                 streams=[],
+                add_default_streams=True,
             ),
         )
 
@@ -1620,6 +2450,760 @@ def test_users_invite_reports_permission_error(capsys):
     assert capsys.readouterr().err == (
         "Error: Must be an organization administrator\n"
     )
+@
+
+
+\subsection{Sharing one link: \texttt{users invite-link}}
+
+An emailed invitation needs to know who it is for.
+Sometimes nobody does---a cohort assembles from a course roster the
+organiser never sees, or the invitation travels through a channel the
+Zulip server has no address for.
+A multi-use link answers that: the server mints a URL, and anyone
+holding it can join under the role and subscriptions baked into it
+when it was created.
+
+That last part is what makes the command worth having separately
+rather than as a flag on [[users invite]].
+Because the streams are fixed at creation time, one link per group
+gives each group its own starting subscriptions: a guest link for one
+course, another for a second, each seeing only its own streams.
+Paired with [[--no-add-default-streams]] the subscription set is
+exactly what was asked for and nothing else.
+
+The link is created by a [[POST]] with no recipients at all, and every
+parameter is optional, so the shared option chunk carries the whole
+signature.
+
+<<functions>>=
+@users_app.command("invite-link")
+def _users_invite_link_handler(
+    ctx: typer.Context,
+    <<invitation options>>
+):
+    """Create a reusable invitation link."""
+    users_invite_link_command(
+        _get_user_client_from_context(ctx),
+        SimpleNamespace(
+            <<invitation arguments>>
+        ),
+    )
+@
+
+Streams resolve before the request for the same reason they do when
+inviting by email: an unknown name should fail before anything exists,
+and a link that has already been created cannot be un-created without
+a second call.
+
+The response carries the URL, and we print that alone on stdout so the
+command composes---piped into [[xclip]], captured by a shell
+variable, or pasted into a course page.
+
+<<functions>>=
+def users_invite_link_command(client, args):
+    """Create a reusable invitation link and print it."""
+    stream_ids = _resolve_stream_ids(client, args.streams)
+
+    request = {
+        "invite_as": _INVITE_ROLE_CODES[args.invite_as.value],
+        "include_realm_default_subscriptions":
+            args.add_default_streams,
+    }
+    if args.expires_in is not None:
+        request["invite_expires_in_minutes"] = args.expires_in
+    if stream_ids:
+        request["stream_ids"] = stream_ids
+
+    result = _require_invite_success(client.call_endpoint(
+        url="invites/multiuse",
+        method="POST",
+        request=request,
+    ))
+    print(result["invite_link"])
+@
+
+Note that the booleans and integers go into the request as native
+Python values.
+The client library serialises every non-string field with
+[[json.dumps]] before sending it, so [[True]] arrives as JSON
+[[true]]---which is what the server's validator expects, and what
+formatting the value ourselves with [[str]] would have got wrong.
+
+Let's verify the minimal call: default role, no streams, no expiry.
+
+<<test functions>>=
+def test_users_invite_link_sends_minimal_request(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invite_link": "https://chat.example.com/join/abc/",
+    }
+
+    users_invite_link_command(
+        client,
+        SimpleNamespace(
+            invite_as=InviteRole.member,
+            expires_in=None,
+            streams=[],
+            add_default_streams=True,
+        ),
+    )
+
+    client.call_endpoint.assert_called_once_with(
+        url="invites/multiuse",
+        method="POST",
+        request={
+            "invite_as": 400,
+            "include_realm_default_subscriptions": True,
+        },
+    )
+    client.get_stream_id.assert_not_called()
+    assert capsys.readouterr().out == (
+        "https://chat.example.com/join/abc/\n"
+    )
+@
+
+The per-cohort case is the interesting one: a guest link limited to
+exactly two streams and nothing else.
+
+<<test functions>>=
+def test_users_invite_link_scopes_streams_exactly():
+    client = MagicMock()
+    client.get_stream_id.side_effect = [
+        {"result": "success", "stream_id": 7},
+        {"result": "success", "stream_id": 11},
+    ]
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invite_link": "https://chat.example.com/join/abc/",
+    }
+
+    users_invite_link_command(
+        client,
+        SimpleNamespace(
+            invite_as=InviteRole.guest,
+            expires_in=1440,
+            streams=["general", "course-1"],
+            add_default_streams=False,
+        ),
+    )
+
+    client.call_endpoint.assert_called_once_with(
+        url="invites/multiuse",
+        method="POST",
+        request={
+            "invite_as": 600,
+            "include_realm_default_subscriptions": False,
+            "invite_expires_in_minutes": 1440,
+            "stream_ids": [7, 11],
+        },
+    )
+@
+
+An unknown stream aborts before any link exists.
+
+<<test functions>>=
+def test_users_invite_link_reports_unknown_stream(capsys):
+    client = MagicMock()
+    client.get_stream_id.return_value = {
+        "result": "error",
+        "msg": "Invalid channel name 'missing'",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_invite_link_command(
+            client,
+            SimpleNamespace(
+                invite_as=InviteRole.member,
+                expires_in=None,
+                streams=["missing"],
+                add_default_streams=True,
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: Invalid channel name 'missing'\n"
+    )
+    client.call_endpoint.assert_not_called()
+@
+
+A bot API key is the likely first attempt, so that path gets the
+credential hint rather than the server's bare wording.
+
+<<test functions>>=
+def test_users_invite_link_hints_when_the_key_is_a_bot(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = {
+        "result": "error",
+        "code": "BAD_REQUEST",
+        "msg": "This endpoint does not accept bot requests.",
+    }
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_invite_link_command(
+            client,
+            SimpleNamespace(
+                invite_as=InviteRole.member,
+                expires_in=None,
+                streams=[],
+                add_default_streams=True,
+            ),
+        )
+
+    assert excinfo.value.code == 1
+    assert "ZULIP_USER_API_KEY" in capsys.readouterr().err
+@
+
+The wiring test confirms the shared option chunk reaches this command
+too, including the negated boolean form Typer generates.
+
+<<test functions>>=
+def test_users_invite_link_cli_passes_options(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "users_invite_link_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_user_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, [
+        "users", "invite-link",
+        "--as", "guest",
+        "--expires-in", "60",
+        "-s", "general",
+        "--no-add-default-streams",
+    ])
+
+    assert result.exit_code == 0
+    assert seen["args"].invite_as == InviteRole.guest
+    assert seen["args"].expires_in == 60
+    assert seen["args"].streams == ["general"]
+    assert seen["args"].add_default_streams is False
+@
+
+
+\subsection{Selecting an invitation}
+\label{sec:invite-selection}
+
+The two remaining verbs act on invitations that already exist, so each
+needs a way to say which.
+They select by regex over the same handle the listing prints, which
+means anything visible in [[users invited]] can be pasted back as a
+selector, and no separate identifier has to be exposed for the purpose.
+
+<<functions>>=
+def _resolve_invitations_matching_patterns(client, pattern_strs):
+    """Return pending invitations matching the given patterns."""
+    patterns = _compile_patterns(pattern_strs)
+    return [
+        invite
+        for invite in sorted(_fetch_invitations(client),
+                             key=_invite_sort_key)
+        if _matches_patterns([_invite_handle(invite)], patterns)
+    ]
+@
+
+Confirmation follows the policy [[send --to]] already established, for
+the same reason: a regex that the caller expected to name one thing
+can quietly name several.
+The preview goes to stderr so that stdout stays usable in a pipeline,
+and a non-interactive stdin refuses outright rather than assuming
+consent---a script that fans out unexpectedly is exactly the case
+where the mistake is most expensive.
+
+<<functions>>=
+def _confirm_invitations(invites, *, action, assume_yes):
+    """Confirm acting on more than one matched invitation."""
+    for invite in invites:
+        print(_format_invitation_row(invite), file=sys.stderr)
+    if assume_yes:
+        return True
+    stdin_is_tty = getattr(sys.stdin, "isatty", None)
+    if not stdin_is_tty or not stdin_is_tty():
+        _exit_with_error(
+            f"matched {len(invites)} invitations; "
+            f"pass --yes to {action} without confirmation"
+        )
+    answer = input(
+        f"{action.capitalize()} {len(invites)} invitations? [y/N] "
+    )
+    return answer.strip().lower() in {"y", "yes"}
+@
+
+Both verbs share the same selection, so it is one function.
+Confirming only above one match matches [[send]], where naming a
+single recipient explicitly is taken as meaning it.
+
+<<functions>>=
+def _select_invitations(client, pattern_strs, *, action, assume_yes):
+    """Return the invitations a destructive verb should act on."""
+    invites = _resolve_invitations_matching_patterns(
+        client,
+        pattern_strs,
+    )
+    if not invites:
+        _exit_with_error(
+            f"{_describe_patterns(pattern_strs)} matched no "
+            "pending invitations"
+        )
+    if len(invites) > 1 and not _confirm_invitations(
+        invites,
+        action=action,
+        assume_yes=assume_yes,
+    ):
+        _exit_with_error("aborted by user")
+    return invites
+@
+
+
+\subsection{Revoking an invitation: \texttt{users revoke}}
+
+Revoking withdraws an outstanding invitation: an emailed one can no
+longer be redeemed, and a link stops admitting anyone new.
+
+The pattern argument is required rather than optional, and that is a
+safety property rather than a style choice.
+An empty pattern list matches everything---which is what makes
+[[users invited]] with no arguments list the lot---so a [[revoke]]
+that tolerated no arguments would treat \enquote{say nothing} as
+\enquote{destroy everything}.
+Typer enforces the requirement by rejecting the call before any
+request is made.
+
+<<functions>>=
+@users_app.command("revoke")
+def _users_revoke_handler(
+    ctx: typer.Context,
+    patterns: Annotated[
+        list[str],
+        typer.Argument(
+            help="select invitations by invitee email or link URL "
+                 "(regex; repeat to OR several)",
+        ),
+    ],
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="skip confirmation when the patterns match "
+                 "several invitations",
+        ),
+    ] = False,
+):
+    """Revoke pending invitations."""
+    users_revoke_command(
+        _get_user_client_from_context(ctx),
+        SimpleNamespace(patterns=patterns, yes=yes),
+    )
+@
+
+The endpoint is derived from each record rather than from an
+identifier we carried around, which is what keeps the two kinds apart
+(\cref{sec:invite-records}).
+
+The listing and the deletions are separate requests, so an invitation
+can be redeemed or expire in between; the server's error then surfaces
+verbatim, and a multi-match revoke that fails midway leaves the
+earlier deletions in place.
+We accept that rather than invent a transaction the API does not
+offer---the same policy [[users invite]] already applies to a
+partially failed batch.
+
+Success is silent, matching [[users invite]]; when more than one
+invitation was involved the confirmation step has already listed them.
+
+<<functions>>=
+def users_revoke_command(client, args):
+    """Revoke the pending invitations matching the given patterns."""
+    for invite in _select_invitations(
+        client,
+        args.patterns,
+        action="revoke",
+        assume_yes=args.yes,
+    ):
+        _require_invite_success(client.call_endpoint(
+            url=_invite_endpoint(invite),
+            method="DELETE",
+        ))
+@
+
+Let's verify that each kind is addressed at its own endpoint.
+Because the listing request comes first, the assertions look at the
+whole call list rather than at a single call.
+
+<<test functions>>=
+def test_users_revoke_deletes_an_email_invitation():
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+    ]
+
+    users_revoke_command(
+        client,
+        SimpleNamespace(patterns=["newcomer@"], yes=False),
+    )
+
+    assert client.call_endpoint.call_args_list[-1] == call(
+        url="invites/7",
+        method="DELETE",
+    )
+@
+
+The colliding identifiers are the point of the fixture: an email
+invitation and a link both carry [[id]] [[7]], so selecting the link
+must not delete the email invitation.
+
+<<test functions>>=
+def test_users_revoke_disambiguates_colliding_ids():
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+    ]
+
+    users_revoke_command(
+        client,
+        SimpleNamespace(patterns=["join/abc"], yes=False),
+    )
+
+    assert client.call_endpoint.call_args_list[-1] == call(
+        url="invites/multiuse/7",
+        method="DELETE",
+    )
+@
+
+With [[--yes]] a multi-match revokes every one of them, in the listed
+order.
+
+<<test functions>>=
+def test_users_revoke_removes_every_confirmed_match():
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+        {"result": "success"},
+        {"result": "success"},
+    ]
+
+    users_revoke_command(
+        client,
+        SimpleNamespace(patterns=[""], yes=True),
+    )
+
+    assert client.call_endpoint.call_args_list[1:] == [
+        call(url="invites/8", method="DELETE"),
+        call(url="invites/7", method="DELETE"),
+        call(url="invites/multiuse/7", method="DELETE"),
+    ]
+@
+
+A pattern that names nothing is an error rather than a silent success,
+because the caller asked for something to happen.
+
+<<test functions>>=
+def test_users_revoke_reports_no_match(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_revoke_command(
+            client,
+            SimpleNamespace(patterns=["nobody"], yes=False),
+        )
+
+    assert excinfo.value.code == 1
+    assert capsys.readouterr().err == (
+        "Error: pattern 'nobody' matched no pending invitations\n"
+    )
+@
+
+A single match proceeds without asking, so the prompt never runs.
+
+<<test functions>>=
+def test_users_revoke_single_match_needs_no_prompt(monkeypatch):
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+    ]
+
+    def refuse_input(prompt=""):
+        raise AssertionError("should not prompt for one match")
+
+    monkeypatch.setattr("builtins.input", refuse_input)
+
+    users_revoke_command(
+        client,
+        SimpleNamespace(patterns=["newcomer@"], yes=False),
+    )
+@
+
+On a pipe a multi-match refuses rather than prompting, and says which
+flag would have allowed it.
+
+<<test functions>>=
+def test_users_revoke_refuses_multi_match_on_a_pipe(
+    capsys,
+    monkeypatch,
+):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO(""))
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_revoke_command(
+            client,
+            SimpleNamespace(patterns=[""], yes=False),
+        )
+
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert "pass --yes to revoke" in err
+@
+
+Declining the prompt aborts without touching anything.
+
+<<test functions>>=
+def test_users_revoke_declining_the_prompt_aborts(
+    capsys,
+    monkeypatch,
+):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_revoke_command(
+            client,
+            SimpleNamespace(patterns=[""], yes=False),
+        )
+
+    assert excinfo.value.code == 1
+    assert "aborted by user" in capsys.readouterr().err
+    assert client.call_endpoint.call_count == 1
+@
+
+The preview belongs on stderr so a pipeline reading stdout sees
+nothing from it.
+
+<<test functions>>=
+def test_users_revoke_previews_matches_on_stderr(capsys):
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+        {"result": "success"},
+        {"result": "success"},
+    ]
+
+    users_revoke_command(
+        client,
+        SimpleNamespace(patterns=[""], yes=True),
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "newcomer@example.com" in captured.err
+@
+
+Typer rejects the call outright when no pattern is given.
+
+<<test functions>>=
+def test_users_revoke_cli_requires_a_pattern():
+    result = runner.invoke(app, ["users", "revoke"])
+
+    assert result.exit_code == 2
+@
+
+<<test functions>>=
+def test_users_revoke_cli_passes_patterns_and_yes(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "users_revoke_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_user_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(
+        app,
+        ["users", "revoke", "-y", "ann", "bob"],
+    )
+
+    assert result.exit_code == 0
+    assert seen["args"].patterns == ["ann", "bob"]
+    assert seen["args"].yes is True
+@
+
+
+\subsection{Resending an invitation: \texttt{users resend}}
+
+An emailed invitation can be sent again, which is the usual remedy
+when it landed in a spam folder.
+A link cannot: there is no address to send it to, and no endpoint for
+the operation.
+
+That asymmetry has to be handled rather than hidden, because a
+perfectly reasonable pattern can span both kinds.
+We skip the links individually with a note on stderr, so the email
+invitations the caller meant still get resent, but refuse outright
+when \emph{every} match was a link---a resend that resent nothing must
+not report success.
+
+<<functions>>=
+@users_app.command("resend")
+def _users_resend_handler(
+    ctx: typer.Context,
+    patterns: Annotated[
+        list[str],
+        typer.Argument(
+            help="select invitations by invitee email "
+                 "(regex; repeat to OR several)",
+        ),
+    ],
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="skip confirmation when the patterns match "
+                 "several invitations",
+        ),
+    ] = False,
+):
+    """Resend pending email invitations."""
+    users_resend_command(
+        _get_user_client_from_context(ctx),
+        SimpleNamespace(patterns=patterns, yes=yes),
+    )
+@
+
+<<functions>>=
+def users_resend_command(client, args):
+    """Resend the pending email invitations matching the patterns."""
+    selected = _select_invitations(
+        client,
+        args.patterns,
+        action="resend",
+        assume_yes=args.yes,
+    )
+    if all(_invite_is_multiuse(invite) for invite in selected):
+        _exit_with_error(
+            f"{_describe_patterns(args.patterns)} matched only "
+            "invitation links, which cannot be resent"
+        )
+    for invite in selected:
+        if _invite_is_multiuse(invite):
+            print(
+                f"skipping {_invite_handle(invite)}: "
+                "an invitation link cannot be resent",
+                file=sys.stderr,
+            )
+            continue
+        _require_invite_success(client.call_endpoint(
+            url=f"invites/{invite['id']}/resend",
+            method="POST",
+        ))
+@
+
+Let's verify the ordinary case first.
+
+<<test functions>>=
+def test_users_resend_resends_an_email_invitation():
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+    ]
+
+    users_resend_command(
+        client,
+        SimpleNamespace(patterns=["newcomer@"], yes=False),
+    )
+
+    assert client.call_endpoint.call_args_list[-1] == call(
+        url="invites/7/resend",
+        method="POST",
+    )
+@
+
+A mixed match resends what it can and says what it skipped.
+
+<<test functions>>=
+def test_users_resend_skips_invitation_links(capsys):
+    client = MagicMock()
+    client.call_endpoint.side_effect = [
+        _make_invitations(),
+        {"result": "success"},
+        {"result": "success"},
+    ]
+
+    users_resend_command(
+        client,
+        SimpleNamespace(patterns=[""], yes=True),
+    )
+
+    assert client.call_endpoint.call_args_list[1:] == [
+        call(url="invites/8/resend", method="POST"),
+        call(url="invites/7/resend", method="POST"),
+    ]
+    assert "cannot be resent" in capsys.readouterr().err
+@
+
+When every match is a link there is nothing to resend, and that is a
+failure rather than a no-op.
+
+<<test functions>>=
+def test_users_resend_refuses_a_link_only_match(capsys):
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    with pytest.raises(SystemExit) as excinfo:
+        users_resend_command(
+            client,
+            SimpleNamespace(patterns=["join/abc"], yes=False),
+        )
+
+    assert excinfo.value.code == 1
+    assert "cannot be resent" in capsys.readouterr().err
+    assert client.call_endpoint.call_count == 1
+@
+
+<<test functions>>=
+def test_users_resend_cli_passes_patterns_and_yes(monkeypatch):
+    seen = {}
+
+    monkeypatch.setattr(
+        cli,
+        "users_resend_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_user_client_from_context",
+        lambda ctx: "client",
+    )
+
+    result = runner.invoke(app, ["users", "resend", "ann"])
+
+    assert result.exit_code == 0
+    assert seen["args"].patterns == ["ann"]
+    assert seen["args"].yes is False
 @
 
 
@@ -5362,7 +6946,7 @@ def _bot_handler(
     if not command:
         _exit_with_error("bot requires a worker command")
     bot_command(
-        _get_client_from_context(ctx),
+        _get_bot_client_from_context(ctx),
         SimpleNamespace(command=command, stdin_format=stdin_format),
     )
 @
@@ -5381,7 +6965,7 @@ def test_bot_cli_passes_worker_command(monkeypatch):
     monkeypatch.setattr(cli, "bot_command", fake_bot_command)
     monkeypatch.setattr(
         cli,
-        "_get_client_from_context",
+        "_get_bot_client_from_context",
         lambda ctx: "client",
     )
 
@@ -5410,7 +6994,7 @@ def test_bot_cli_passes_stdin_format(monkeypatch):
     monkeypatch.setattr(cli, "bot_command", fake_bot_command)
     monkeypatch.setattr(
         cli,
-        "_get_client_from_context",
+        "_get_bot_client_from_context",
         lambda ctx: "client",
     )
 
@@ -6835,8 +8419,11 @@ surface.
 We therefore register the handlers through one helper that binds the
 shared command implementations to whichever [[typer.Typer]] instance
 we are constructing.
-The [[users]] group is attached with [[add_typer]] so its three
-subcommands ride along; the remaining verbs stay flat.
+The [[users]] group is attached with [[add_typer]] so every one of
+its subcommands rides along; the remaining verbs stay flat.
+That is also why adding a [[users]] verb needs no edit here: the
+decorator attached it to [[users_app]] already, and the group is what
+this helper registers.
 
 <<functions>>=
 def _register_commands(target: typer.Typer) -> None:
@@ -7668,7 +9255,7 @@ def test_topic_completion_uses_stream_from_context(monkeypatch):
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     result = complete_topic_names(
@@ -7690,7 +9277,7 @@ def test_topic_completion_silently_ignores_missing_stream(monkeypatch):
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     assert complete_topic_names(
@@ -7733,7 +9320,7 @@ def test_user_completion_emits_one_candidate_per_matching_field(
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     assert complete_user_emails(
@@ -7769,7 +9356,7 @@ def test_user_completion_returns_full_name_for_name_only_prefix(
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     assert complete_user_emails(
@@ -7799,7 +9386,7 @@ def test_user_completion_dedupes_identical_values(monkeypatch):
     monkeypatch.setattr(
         cli.zulipcli,
         "get_client",
-        lambda zuliprc=None: client,
+        lambda zuliprc=None, **kwargs: client,
     )
 
     assert complete_user_emails(
@@ -7810,6 +9397,24 @@ def test_user_completion_dedupes_identical_values(monkeypatch):
         ("q-bot@example.zulipchat.com", "Q Bot"),
     ]
 @
+
+The tests above call the completion callbacks directly.
+This last one instead drives the whole entry path a shell goes
+through, because the interesting behaviour is not in the callback: it
+is whether the resolver reconstructs enough context to hand the
+callback a [[--zuliprc]] from before the subcommand name and a
+[[--stream]] from within it.
+
+It has to be \emph{Typer's} resolver rather than Click's.
+Typer vendors its own copy of Click's internals, and its
+[[TyperGroup]] is no longer a subclass of [[click.Group]], so Click's
+resolver takes its \enquote{not a group} branch, stops at the root
+command, and reports no candidates at all---for every option, not just
+this one.
+Driving it through [[get_completions]] also keeps the test to one
+import instead of two, and [[BashComplete]] is used only because
+[[ShellComplete]] itself is abstract---the resolution being exercised
+is shared by every shell.
 
 <<test functions>>=
 def test_click_completion_path_uses_context_for_zuliprc_and_stream(
@@ -7829,28 +9434,19 @@ def test_click_completion_path_uses_context_for_zuliprc_and_stream(
     }
     seen = {}
 
-    def get_client(zuliprc=None):
+    def get_client(zuliprc=None, **kwargs):
         seen["zuliprc"] = zuliprc
         return client
 
     monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
 
-    command = get_command(app)
-    context = _resolve_context(
-        command,
+    completer = BashComplete(
+        get_command(app),
         {},
         "zulipcli",
-        [
-            "--zuliprc",
-            "/tmp/custom.zuliprc",
-            "send",
-            "--stream",
-            "general",
-            "--topic",
-        ],
+        "_ZULIPCLI_COMPLETE",
     )
-    obj, incomplete = _resolve_incomplete(
-        context,
+    completions = completer.get_completions(
         [
             "--zuliprc",
             "/tmp/custom.zuliprc",
@@ -7862,8 +9458,7 @@ def test_click_completion_path_uses_context_for_zuliprc_and_stream(
         "A",
     )
 
-    completions = obj.shell_complete(context, incomplete)
-
     assert [item.value for item in completions] == ["Announcements"]
     assert seen["zuliprc"] == "/tmp/custom.zuliprc"
+    client.get_stream_id.assert_called_once_with("general")
 @
