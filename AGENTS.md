@@ -214,6 +214,20 @@ Three consequences worth knowing:
   belong to the embedding host, which is why `build_embedded_app()`
   declares none. A test asserts the absence.
 
+This model is documented for *users* in the help texts, and the
+standalone and embedded forms carry different instructions. Three
+epilog constants in `cli.nw` hold that text: `CREDENTIALS_EPILOG`
+(standalone `--help`; mentions `--zuliprc`) and
+`EMBEDDED_CREDENTIALS_EPILOG` (embedded form; the host picks the file,
+and a host can replace the text via `build_embedded_app(epilog=...)`)
+share a `PERSONA_EPILOG` middle by concatenation, so the two forms
+cannot describe different persona models. The invitation commands
+share `INVITATION_HELP_EPILOG`, which must stay form-neutral (no
+`--zuliprc`) because the same command objects are registered on both
+apps. Tests pin all of this, including that `--zuliprc` is absent from
+the embedded help. When changing the credential model, change the
+epilogs with it.
+
 ## Term Index
 
 Every message-reading path feeds a local SQLite term index, so `read`,

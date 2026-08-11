@@ -164,11 +164,23 @@ The standalone form keeps Typer's completion-installation flags, while
 the embedded form disables them by default so the host owns that
 surface.
 
+Both applications end their help with an epilog summarising where
+credentials come from, so [[--help]] answers the configuration
+question without sending the reader to a manual.
+The two forms need different instructions, because they disagree
+about exactly one thing: the standalone form selects the
+configuration file with [[--zuliprc]], while the embedded form has
+no such option and leaves that choice to its host.
+The epilog texts are defined in \cref{sec:personas}, next to the
+resolution rules they summarise, so text and rules cannot drift
+apart without the drift being visible in one place.
+
 <<constants>>=
 APP_HELP = "Command-line interface for Zulip"
 <<applications>>=
 app = typer.Typer(
     help=APP_HELP,
+    epilog=CREDENTIALS_EPILOG,
     add_completion=True,
     no_args_is_help=True,
 )
@@ -181,7 +193,9 @@ def configure_app(
     zuliprc: Annotated[
         Optional[Path],
         typer.Option(
-            help="path to zuliprc config file (default: ~/.zuliprc)",
+            help="path to zuliprc config file, overriding the "
+            "default ~/.zuliprc and the persona files "
+            "~/.zuliprc.user and ~/.zuliprc.bot",
             dir_okay=False,
         ),
     ] = None,
@@ -387,6 +401,96 @@ can own them; adding one here would either break that contract or
 leave the two forms with different option sets.
 A caller who needs a one-off override already has [[--zuliprc]].
 
+None of these resolution rules is visible from the command line
+unless we print them.
+A configuration model that lives only in this document fails its
+users at exactly the wrong moment---the first run, before anything is
+configured---so the standalone application's help carries the summary
+as an epilog, and \enquote{how do I configure this?} is answered by
+the [[--help]] the user was going to type anyway.
+
+The epilog is plain paragraphs separated by blank lines because that
+is all the help renderer preserves: Typer hands help text to Rich,
+which reflows every paragraph to the terminal width and ignores
+Click's [[\b]] no-rewrap marker, so a hand-aligned table of variables
+would be mangled into one run-on line.
+Prose survives reflowing; layout does not.
+
+The standalone and embedded forms disagree about a single sentence:
+who picks the configuration file.
+Everything else---the personas, the variables, which commands demand
+which persona---is true in both, so the shared part is one constant
+and each form prepends its own opening paragraph.
+Concatenation, rather than two complete texts, is what guarantees
+the two forms cannot describe two different persona models.
+
+<<constants>>=
+PERSONA_EPILOG = (
+    "Two optional personas keep the human and the bot apart. The "
+    "user persona reads ~/.zuliprc.user plus ZULIP_USER_API_KEY "
+    "and ZULIP_USER_EMAIL; the bot persona reads ~/.zuliprc.bot "
+    "plus ZULIP_BOT_API_KEY and ZULIP_BOT_EMAIL; both share "
+    "ZULIP_SITE. An environment variable overrides only its own "
+    "field of the chosen file, so a zuliprc may hold just email "
+    "and site while the API key stays out of every file.\n\n"
+    "Commands prefer the user persona, so once one is configured, "
+    "messages are sent in your name. The invitation commands "
+    "require it, because Zulip rejects bot API keys there. The "
+    "bot command never uses it: it runs as the bot persona, or "
+    "plain ~/.zuliprc."
+)
+CREDENTIALS_EPILOG = (
+    "Credentials are read from a zuliprc file, by default "
+    "~/.zuliprc; --zuliprc selects another file explicitly.\n\n"
+    + PERSONA_EPILOG
+)
+EMBEDDED_CREDENTIALS_EPILOG = (
+    "Credentials are read from a zuliprc file, by default "
+    "~/.zuliprc; the host application decides how another file "
+    "is selected.\n\n"
+    + PERSONA_EPILOG
+)
+@
+
+Let's verify that the help output really teaches the configuration:
+every file and variable a user needs must survive the trip through
+the renderer and come out in [[--help]].
+The variable names are single words shorter than any plausible
+terminal width, so reflowing cannot split them and substring
+assertions are safe.
+
+<<test functions>>=
+def test_cli_help_documents_credential_configuration():
+    result = runner.invoke(app, ["--help"])
+
+    for needle in (
+        ".zuliprc.user",
+        ".zuliprc.bot",
+        "ZULIP_USER_API_KEY",
+        "ZULIP_USER_EMAIL",
+        "ZULIP_BOT_API_KEY",
+        "ZULIP_BOT_EMAIL",
+        "ZULIP_SITE",
+        "--zuliprc",
+    ):
+        assert needle in result.output
+@
+
+The embedded form must teach the same personas while never
+mentioning an option it does not have; asserting the absence of
+[[--zuliprc]] pins the difference between the two instructions, not
+just their overlap.
+
+<<test functions>>=
+def test_embedded_help_documents_credentials_without_zuliprc():
+    embedded_app = cli.build_embedded_app()
+    result = runner.invoke(embedded_app, ["--help"])
+
+    assert "ZULIP_USER_API_KEY" in result.output
+    assert "ZULIP_BOT_API_KEY" in result.output
+    assert "--zuliprc" not in result.output
+@
+
 \subsection{The embedded application}
 
 The standalone and embedded applications share the same command
@@ -397,10 +501,17 @@ handlers onto it.
 That keeps the standalone and embedded command surfaces aligned without
 forcing either form to own the other's root options.
 
+The credential epilog defaults to the embedded variant from
+\cref{sec:personas}---the one that does not name [[--zuliprc]]---and
+is overridable exactly like [[help]], because a host that supplies
+its own configuration story (say, a config command of its own) must
+be able to replace ours rather than contradict it.
+
 <<functions>>=
 def build_embedded_app(
     *,
     help: Optional[str] = None,
+    epilog: Optional[str] = None,
     add_completion: bool = False,
     no_args_is_help: bool = True,
 ) -> typer.Typer:
@@ -411,10 +522,13 @@ def build_embedded_app(
         parent.add_typer(build_embedded_app(), name="zulip")
 
     The host callback should store the resolved zuliprc path in
-    `ctx.obj["zuliprc"]` before the embedded commands run.
+    `ctx.obj["zuliprc"]` before the embedded commands run. The help
+    ends with an epilog explaining the credential configuration;
+    pass `epilog` to replace it with the host's own instructions.
     """
     embedded_app = typer.Typer(
         help=APP_HELP if help is None else help,
+        epilog=EMBEDDED_CREDENTIALS_EPILOG if epilog is None else epilog,
         add_completion=add_completion,
         no_args_is_help=no_args_is_help,
     )
@@ -1685,6 +1799,48 @@ def test_require_invite_success_exits_with_the_hint(capsys):
     assert "ZULIP_USER_API_KEY" in capsys.readouterr().err
 @
 
+The hint only appears after a failed call, which is one call too
+late for a reader who checks [[--help]] before configuring anything.
+Each invitation command therefore also announces the requirement in
+its help epilog, so the requirement is readable before the first
+attempt.
+The epilog names the same knobs as the hint, so the two ways of
+discovering the requirement cannot disagree.
+Unlike the root epilogs of \cref{sec:personas}, this text must not
+mention [[--zuliprc]]: the command objects are registered on both
+the standalone and the embedded application, so a command epilog can
+only claim what is true on both surfaces, and the file-selection
+knob is the one thing they disagree on.
+
+<<constants>>=
+INVITATION_HELP_EPILOG = (
+    "Zulip rejects bot API keys on the invitation API, so this "
+    "command runs as the user persona: ~/.zuliprc.user, or "
+    "ZULIP_USER_API_KEY and ZULIP_USER_EMAIL in the environment. "
+    "The top-level --help describes the whole credential model."
+)
+@
+
+Let's verify that every invitation verb announces the requirement,
+and that an ordinary verb does not---on a command that accepts any
+credentials the same epilog would be noise, so its absence is as
+much a part of the design as its presence.
+
+<<test functions>>=
+def test_invitation_help_names_the_user_persona():
+    for verb in ("invited", "invite", "invite-link", "revoke",
+                 "resend"):
+        result = runner.invoke(app, ["users", verb, "--help"])
+
+        assert "ZULIP_USER_API_KEY" in result.output, verb
+
+<<test functions>>=
+def test_ordinary_help_does_not_demand_a_persona():
+    result = runner.invoke(app, ["users", "list", "--help"])
+
+    assert "ZULIP_USER_API_KEY" not in result.output
+@
+
 
 \subsection{Reading an invitation record}
 \label{sec:invite-records}
@@ -1850,7 +2006,7 @@ selects links---without the caller having to say which kind they
 meant.
 
 <<functions>>=
-@users_app.command("invited")
+@users_app.command("invited", epilog=INVITATION_HELP_EPILOG)
 def _users_invited_handler(
     ctx: typer.Context,
     patterns: Annotated[
@@ -2190,7 +2346,7 @@ That is what keeps a change to the role help text or the completion
 callback from silently applying to only one of the two commands.
 
 <<functions>>=
-@users_app.command("invite")
+@users_app.command("invite", epilog=INVITATION_HELP_EPILOG)
 def _users_invite_handler(
     ctx: typer.Context,
     emails: Annotated[
@@ -2476,7 +2632,7 @@ parameter is optional, so the shared option chunk carries the whole
 signature.
 
 <<functions>>=
-@users_app.command("invite-link")
+@users_app.command("invite-link", epilog=INVITATION_HELP_EPILOG)
 def _users_invite_link_handler(
     ctx: typer.Context,
     <<invitation options>>
@@ -2778,7 +2934,7 @@ Typer enforces the requirement by rejecting the call before any
 request is made.
 
 <<functions>>=
-@users_app.command("revoke")
+@users_app.command("revoke", epilog=INVITATION_HELP_EPILOG)
 def _users_revoke_handler(
     ctx: typer.Context,
     patterns: Annotated[
@@ -3066,7 +3222,7 @@ when \emph{every} match was a link---a resend that resent nothing must
 not report success.
 
 <<functions>>=
-@users_app.command("resend")
+@users_app.command("resend", epilog=INVITATION_HELP_EPILOG)
 def _users_resend_handler(
     ctx: typer.Context,
     patterns: Annotated[
@@ -3230,6 +3386,13 @@ Because a loose pattern can reach more people than intended, a
 multi-match send pauses for confirmation on an interactive terminal
 and requires [[--yes]] on a pipe.
 
+Whose name a message carries changed when the personas of
+\cref{sec:personas} arrived: with a user persona configured, [[send]]
+posts as the human, where it used to post as the bot.
+That is visible to every reader of the message, so the docstring says
+it---the reader of [[send --help]] is exactly the person about to
+sign something with their own name.
+
 <<functions>>=
 def _send_handler(
     ctx: typer.Context,
@@ -3274,7 +3437,12 @@ def _send_handler(
         typer.Argument(help="message content (reads stdin if omitted)"),
     ] = None,
 ):
-    """Send a message."""
+    """Send a message.
+
+    The message is sent as the user persona when one is configured,
+    so it carries your name rather than the bot's; see the top-level
+    `--help` for how credentials are chosen.
+    """
     send_command(
         _get_client_from_context(ctx),
         SimpleNamespace(
@@ -6888,6 +7056,10 @@ We keep that example on a single line: Typer renders help through Rich,
 which ignores Click's [[\b]] no-rewrap marker, so a multi-line example
 would be reflowed into one run-on line with a stray continuation
 backslash.
+The docstring also states the credential exception of
+\cref{sec:personas}---the worker runs as the bot persona, never as
+the human---because the person whose unread messages are at stake is
+exactly the person reading [[bot --help]].
 
 The worker also needs the unread messages themselves.
 Some workers are easiest to drive with the plain text that [[read]]
@@ -6941,6 +7113,11 @@ def _bot_handler(
     messages appear, and those unread messages are written to its stdin
     in the format chosen by `--stdin-format` (the same plain text that
     `zulipcli read` prints, or `json`).
+
+    The worker authenticates with the bot persona (`~/.zuliprc.bot`,
+    or `ZULIP_BOT_API_KEY` and `ZULIP_BOT_EMAIL`), falling back to
+    plain `~/.zuliprc`. It never runs as the user persona, so it
+    cannot consume your own unread messages.
     """
     command = list(ctx.args)
     if not command:
