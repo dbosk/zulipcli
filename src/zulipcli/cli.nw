@@ -193,9 +193,9 @@ def configure_app(
     zuliprc: Annotated[
         Optional[Path],
         typer.Option(
-            help="path to zuliprc config file, overriding the "
-            "default ~/.zuliprc and the persona files "
-            "~/.zuliprc.user and ~/.zuliprc.bot",
+            help="path to zuliprc config file, replacing the "
+            "default ~/.zuliprc; the persona files follow as "
+            ".user and .bot suffixes on this path",
             dir_okay=False,
         ),
     ] = None,
@@ -243,18 +243,31 @@ USER_PERSONA = "user"
 BOT_PERSONA = "bot"
 @
 
-A persona is identified by a suffix on the ordinary configuration
-path, so [[~/.zuliprc.user]] sits beside [[~/.zuliprc]] and needs no
-new setting to point at it.
+A persona is identified by a suffix on the configuration path in
+use---not on the default path specifically.
+With no override that means [[~/.zuliprc.user]] beside
+[[~/.zuliprc]], so the simple setup needs no new setting to point at
+it.
+But the path in use is not always the default one: an embedding host
+always supplies its own path (nytid hands over the zuliprc in a
+course's directory), and anchoring the suffix to the home directory
+would leave personas unreachable exactly where split credentials
+matter most---a host that manages several realms needs one pair of
+files \emph{per realm}, sitting beside each realm's plain zuliprc.
 We return a path only when the file exists, because a non-existent
 persona file must fall back to the plain [[zuliprc]] rather than
 become an error: the overwhelmingly common setup has one file and no
 personas at all, and that setup has to keep working untouched.
 
 <<functions>>=
-def _persona_zuliprc(persona):
-    """Return the persona's zuliprc path, if that file exists."""
-    path = Path(f"{zulipcli.DEFAULT_ZULIPRC}.{persona}")
+def _persona_zuliprc(persona, zuliprc=None):
+    """Return the persona's zuliprc path, if that file exists.
+
+    The persona file is the `.<persona>`-suffixed sibling of
+    `zuliprc`, or of the default zuliprc when `zuliprc` is None.
+    """
+    base = zuliprc if zuliprc is not None else zulipcli.DEFAULT_ZULIPRC
+    path = Path(f"{base}.{persona}")
     return str(path) if path.exists() else None
 @
 
@@ -284,12 +297,20 @@ address, because the key is the field that has nowhere else to come
 from.
 An address without a key still needs the file, so it tells us nothing
 about whether the persona stands on its own.
+The active [[zuliprc]] travels along, because a persona configured
+purely by a file is only configured \emph{relative to a base path}:
+[[course/zuliprc.user]] configures the user persona when the course's
+zuliprc is active, and configures nothing when it is not.
 
 <<functions>>=
-def _persona_is_configured(persona):
-    """Return whether any credential source names this persona."""
+def _persona_is_configured(persona, zuliprc=None):
+    """Return whether any credential source names this persona.
+
+    File-based configuration is judged beside `zuliprc`, or beside
+    the default zuliprc when `zuliprc` is None.
+    """
     api_key, _ = _persona_credentials(persona)
-    return bool(api_key) or _persona_zuliprc(persona) is not None
+    return bool(api_key) or _persona_zuliprc(persona, zuliprc) is not None
 @
 
 Ordinary commands prefer the human persona.
@@ -302,19 +323,34 @@ lookup and no suffixed path, which leaves exactly the behaviour this
 CLI had before personas existed.
 
 <<functions>>=
-def _default_persona():
-    """Return the persona ordinary commands should run as."""
+def _default_persona(zuliprc=None):
+    """Return the persona ordinary commands should run as.
+
+    File-based configuration is judged beside `zuliprc`, or beside
+    the default zuliprc when `zuliprc` is None.
+    """
     for persona in (USER_PERSONA, BOT_PERSONA):
-        if _persona_is_configured(persona):
+        if _persona_is_configured(persona, zuliprc):
             return persona
     return None
 @
 
-An explicit [[--zuliprc]] outranks a persona's own file.
-The alternative---letting the persona win---would make the flag a lie
-for the commands that have a persona, and a flag that silently does
-nothing is worse than one that occasionally selects credentials the
-caller did not think about.
+An explicit path---[[--zuliprc]] or a host's choice---moves the whole
+credential family, persona files included: the persona file is the
+suffixed sibling of \emph{that} path, and only when no sibling exists
+does the plain path itself serve the persona.
+Up to version 0.8 the rule was the opposite---an explicit path
+outranked the persona files, which stayed anchored to the home
+directory---on the argument that [[--zuliprc]] must not be silently
+overridden.
+That argument mistook which file the caller means: someone who says
+[[--zuliprc course/zuliprc]] is pointing at a realm, not at one file,
+and expects that realm's personas to apply; and for an embedding host,
+which \emph{always} supplies a path, the old rule quietly disabled
+persona files altogether.
+The suffix rule keeps the flag honest in the way that matters: it
+never reaches outside the family the caller named, since the default
+persona files apply only when the default path does.
 The environment overrides remain in force either way, because they
 name a field rather than a file and so compose with whichever file was
 chosen.
@@ -331,8 +367,9 @@ def _persona_client_arguments(zuliprc, persona):
     api_key = email = None
     if persona is not None:
         api_key, email = _persona_credentials(persona)
-        if zuliprc is None:
-            zuliprc = _persona_zuliprc(persona)
+        persona_file = _persona_zuliprc(persona, zuliprc)
+        if persona_file is not None:
+            zuliprc = persona_file
     return {
         "zuliprc": zuliprc,
         "api_key": api_key,
@@ -361,13 +398,16 @@ Nearly every handler wants the first; the invitation commands, which
 the server would otherwise reject, ask for the second; and the [[bot]]
 worker asks for the third.
 
+The context's zuliprc feeds \emph{both} arguments: which persona is
+configured depends on the files beside the active path, so deciding
+the persona against the default path while reading credentials beside
+the active one would let the two disagree.
+
 <<functions>>=
 def _get_client_from_context(ctx):
     """Create a Zulip client from the current Typer context."""
-    return _client_for_persona(
-        _get_root_zuliprc(ctx),
-        _default_persona(),
-    )
+    zuliprc = _get_root_zuliprc(ctx)
+    return _client_for_persona(zuliprc, _default_persona(zuliprc))
 @
 
 <<functions>>=
@@ -388,10 +428,13 @@ the command used before personas existed.
 <<functions>>=
 def _get_bot_client_from_context(ctx):
     """Create a client for the bot worker, never as the human."""
+    zuliprc = _get_root_zuliprc(ctx)
     persona = (
-        BOT_PERSONA if _persona_is_configured(BOT_PERSONA) else None
+        BOT_PERSONA
+        if _persona_is_configured(BOT_PERSONA, zuliprc)
+        else None
     )
-    return _client_for_persona(_get_root_zuliprc(ctx), persona)
+    return _client_for_persona(zuliprc, persona)
 @
 
 There is deliberately no [[--user-zuliprc]] option to match.
@@ -426,28 +469,32 @@ the two forms cannot describe two different persona models.
 
 <<constants>>=
 PERSONA_EPILOG = (
-    "Two optional personas keep the human and the bot apart. The "
-    "user persona reads ~/.zuliprc.user plus ZULIP_USER_API_KEY "
-    "and ZULIP_USER_EMAIL; the bot persona reads ~/.zuliprc.bot "
-    "plus ZULIP_BOT_API_KEY and ZULIP_BOT_EMAIL; both share "
-    "ZULIP_SITE. An environment variable overrides only its own "
-    "field of the chosen file, so a zuliprc may hold just email "
-    "and site while the API key stays out of every file.\n\n"
+    "Two optional personas keep the human and the bot apart, each "
+    "reading a suffixed sibling of the zuliprc in use: the user "
+    "persona its .user-suffixed file plus ZULIP_USER_API_KEY and "
+    "ZULIP_USER_EMAIL, the bot persona its .bot-suffixed file plus "
+    "ZULIP_BOT_API_KEY and ZULIP_BOT_EMAIL; both share ZULIP_SITE. "
+    "An environment variable overrides only its own field of the "
+    "chosen file, so a zuliprc may hold just email and site while "
+    "the API key stays out of every file.\n\n"
     "Commands prefer the user persona, so once one is configured, "
     "messages are sent in your name. The invitation commands "
     "require it, because Zulip rejects bot API keys there. The "
     "bot command never uses it: it runs as the bot persona, or "
-    "plain ~/.zuliprc."
+    "the plain zuliprc."
 )
 CREDENTIALS_EPILOG = (
     "Credentials are read from a zuliprc file, by default "
-    "~/.zuliprc; --zuliprc selects another file explicitly.\n\n"
+    "~/.zuliprc with the persona files ~/.zuliprc.user and "
+    "~/.zuliprc.bot beside it; --zuliprc selects another file, and "
+    "the persona files follow it as suffixes on the chosen "
+    "path.\n\n"
     + PERSONA_EPILOG
 )
 EMBEDDED_CREDENTIALS_EPILOG = (
-    "Credentials are read from a zuliprc file, by default "
-    "~/.zuliprc; the host application decides how another file "
-    "is selected.\n\n"
+    "Credentials are read from a zuliprc file chosen by the host "
+    "application, with the persona files as .user and .bot "
+    "suffixes on that path.\n\n"
     + PERSONA_EPILOG
 )
 @
@@ -600,9 +647,10 @@ name by hand.
 def _get_completion_client(ctx: typer.Context):
     """Create a Zulip client for shell completion lookups."""
     try:
+        zuliprc = _get_root_zuliprc(ctx)
         return zulipcli.get_client(**_persona_client_arguments(
-            _get_root_zuliprc(ctx),
-            _default_persona(),
+            zuliprc,
+            _default_persona(zuliprc),
         ))
     except Exception:
         return None
@@ -969,6 +1017,45 @@ def test_embedded_app_reads_zuliprc_from_parent_ctx_obj(monkeypatch):
     assert seen["zuliprc"] == "/tmp/fake.zuliprc"
 @
 
+This is the embedded case the suffix rule exists for: the host names
+a zuliprc, a persona file sits beside it, and an ordinary command
+authenticates through the persona file---end to end, with nothing but
+the host's one context entry.
+
+<<test functions>>=
+def test_embedded_app_resolves_personas_beside_the_host_zuliprc(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "zuliprc.user").write_text("[api]\n")
+    client = MagicMock()
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [],
+    }
+    seen = {}
+
+    def get_client(zuliprc=None, **kwargs):
+        seen["zuliprc"] = zuliprc
+        return client
+
+    monkeypatch.setattr(cli.zulipcli, "get_client", get_client)
+
+    parent = typer.Typer()
+
+    @parent.callback()
+    def configure_parent(ctx: typer.Context):
+        ctx.ensure_object(dict)
+        ctx.obj["zuliprc"] = str(tmp_path / "zuliprc")
+
+    parent.add_typer(cli.build_embedded_app(), name="zulip")
+
+    result = runner.invoke(parent, ["zulip", "streams"])
+
+    assert result.exit_code == 0
+    assert seen["zuliprc"] == str(tmp_path / "zuliprc.user")
+@
+
 <<test functions>>=
 def test_standalone_app_still_has_zuliprc_option():
     command = get_command(app)
@@ -1051,20 +1138,46 @@ def test_persona_client_uses_the_persona_file(monkeypatch, tmp_path):
     assert seen["zuliprc"] == str(tmp_path / ".zuliprc.user")
 @
 
-An explicit path wins even when the persona has a file of its own,
-which is what keeps [[--zuliprc]] honest.
+An explicit path carries its persona files with it: the suffixed
+sibling of the explicit path is what the persona reads.
 
 <<test functions>>=
-def test_persona_client_prefers_an_explicit_zuliprc(
+def test_persona_file_follows_an_explicit_zuliprc(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "course.zuliprc.user").write_text("[api]\n")
+    seen = _record_get_client(monkeypatch)
+
+    cli._client_for_persona(
+        str(tmp_path / "course.zuliprc"),
+        cli.USER_PERSONA,
+    )
+
+    assert seen["zuliprc"] == str(tmp_path / "course.zuliprc.user")
+@
+
+The contrast that pins the rule: the \emph{default} persona files no
+longer apply once another path is chosen---the suffix rides on the
+active path, not on [[~/.zuliprc]].
+(The [[isolated_personas]] fixture relocates the default zuliprc to
+[[tmp_path]], so the [[.zuliprc.user]] below is the default persona
+file.)
+
+<<test functions>>=
+def test_explicit_zuliprc_ignores_the_default_persona_files(
     monkeypatch,
     tmp_path,
 ):
     (tmp_path / ".zuliprc.user").write_text("[api]\n")
     seen = _record_get_client(monkeypatch)
 
-    cli._client_for_persona("/tmp/explicit.zuliprc", cli.USER_PERSONA)
+    cli._client_for_persona(
+        str(tmp_path / "course.zuliprc"),
+        cli.USER_PERSONA,
+    )
 
-    assert seen["zuliprc"] == "/tmp/explicit.zuliprc"
+    assert seen["zuliprc"] == str(tmp_path / "course.zuliprc")
 @
 
 The environment overrides individual fields rather than the file, so a
@@ -1143,6 +1256,20 @@ def test_a_persona_file_alone_configures_the_persona(tmp_path):
     assert cli._default_persona() == cli.BOT_PERSONA
 @
 
+Selection follows the same base path as resolution: a persona file
+beside the \emph{active} zuliprc configures the persona, even though
+no default persona file exists.
+Without this, [[_default_persona]] would answer [[None]] for exactly
+the setups the suffix rule exists to serve.
+
+<<test functions>>=
+def test_default_persona_sees_files_beside_the_active_zuliprc(tmp_path):
+    (tmp_path / "course.zuliprc.user").write_text("[api]\n")
+
+    active = str(tmp_path / "course.zuliprc")
+    assert cli._default_persona(active) == cli.USER_PERSONA
+@
+
 The deliberate absence of a per-persona root option is recorded as a
 test, so a future reader sees it as a decision rather than an
 oversight.
@@ -1186,6 +1313,28 @@ def test_bot_client_uses_the_bot_persona(monkeypatch):
     )
 
     assert seen["api_key"] == "bot-secret"
+@
+
+The worker follows the suffix rule too: a [[.bot]] file beside the
+context's zuliprc both selects the bot persona and supplies its
+credentials.
+
+<<test functions>>=
+def test_bot_client_reads_the_bot_file_beside_the_active_zuliprc(
+    monkeypatch,
+    tmp_path,
+):
+    (tmp_path / "course.zuliprc.bot").write_text("[api]\n")
+    seen = _record_get_client(monkeypatch)
+
+    active = str(tmp_path / "course.zuliprc")
+    cli._get_bot_client_from_context(
+        SimpleNamespace(find_root=lambda: SimpleNamespace(
+            params={"zuliprc": active},
+        )),
+    )
+
+    assert seen["zuliprc"] == str(tmp_path / "course.zuliprc.bot")
 @
 
 Finally, the wiring itself: which persona a command resolves is decided
@@ -1744,8 +1893,8 @@ def _invite_error_message(message):
         return message
     return (
         f"{message} The invitation API accepts only human accounts; "
-        "put a human account's credentials in ~/.zuliprc.user or "
-        "ZULIP_USER_API_KEY, or pass --zuliprc."
+        "put a human account's credentials in a .user-suffixed "
+        "sibling of your zuliprc or in ZULIP_USER_API_KEY."
     )
 @
 
@@ -1815,9 +1964,10 @@ knob is the one thing they disagree on.
 <<constants>>=
 INVITATION_HELP_EPILOG = (
     "Zulip rejects bot API keys on the invitation API, so this "
-    "command runs as the user persona: ~/.zuliprc.user, or "
-    "ZULIP_USER_API_KEY and ZULIP_USER_EMAIL in the environment. "
-    "The top-level --help describes the whole credential model."
+    "command runs as the user persona: the .user-suffixed sibling "
+    "of the zuliprc in use, or ZULIP_USER_API_KEY and "
+    "ZULIP_USER_EMAIL in the environment. The top-level --help "
+    "describes the whole credential model."
 )
 @
 
@@ -7114,10 +7264,11 @@ def _bot_handler(
     in the format chosen by `--stdin-format` (the same plain text that
     `zulipcli read` prints, or `json`).
 
-    The worker authenticates with the bot persona (`~/.zuliprc.bot`,
-    or `ZULIP_BOT_API_KEY` and `ZULIP_BOT_EMAIL`), falling back to
-    plain `~/.zuliprc`. It never runs as the user persona, so it
-    cannot consume your own unread messages.
+    The worker authenticates with the bot persona (the
+    `.bot`-suffixed sibling of the zuliprc in use, or
+    `ZULIP_BOT_API_KEY` and `ZULIP_BOT_EMAIL`), falling back to the
+    plain zuliprc. It never runs as the user persona, so it cannot
+    consume your own unread messages.
     """
     command = list(ctx.args)
     if not command:

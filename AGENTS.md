@@ -181,17 +181,25 @@ account's key.
 
 Two personas, `user` and `bot`, each resolve independently:
 
-- File: `~/.zuliprc.<persona>` — used when it exists.
+- File: `<active zuliprc>.<persona>` — used when it exists. The
+  active zuliprc is the one selected by `--zuliprc` or the embedding
+  host, defaulting to `~/.zuliprc`; the persona files are its
+  suffixed siblings (so `~/.zuliprc.user` in the default setup, or
+  e.g. `course/zuliprc.user` when a host supplies `course/zuliprc`).
 - Key: `ZULIP_USER_API_KEY` / `ZULIP_BOT_API_KEY`.
 - Address: `ZULIP_USER_EMAIL` / `ZULIP_BOT_EMAIL`.
 - Server: `ZULIP_SITE`, shared (the library reads it directly).
 
-Precedence for the file is `--zuliprc` > `~/.zuliprc.<persona>` >
-`~/.zuliprc`. The environment variables override *individual fields* of
-whichever file was chosen, because `zulip.Client` merges per field
-rather than per source — so a zuliprc holding only a non-secret email
-and site, plus a key in the environment, keeps secrets off disk
-entirely. Empty values count as unset.
+Precedence for the file is `<active zuliprc>.<persona>` >
+`<active zuliprc>`. (Up to 0.8 the rule was the opposite for an
+explicit `--zuliprc`, and persona files were anchored to the home
+directory — which silently disabled persona files for embedding
+hosts, since a host always supplies a path.) The environment
+variables override *individual fields* of whichever file was chosen,
+because `zulip.Client` merges per field rather than per source — so
+a zuliprc holding only a non-secret email and site, plus a key in
+the environment, keeps secrets off disk entirely. Empty values count
+as unset.
 
 `_get_user_client_from_context()` is for the invitation commands;
 `_get_client_from_context()` is for everything else and picks
