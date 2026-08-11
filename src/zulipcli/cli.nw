@@ -1624,7 +1624,16 @@ def _users_list_handler(
         typer.Option(help="include deactivated accounts in output"),
     ] = False,
 ):
-    """List users on the Zulip server."""
+    """List users on the Zulip server.
+
+    Each row has three tab-separated columns: the full name, the
+    Zulip email (the address the API routes by), and the delivery
+    email (the user's real mailbox). The delivery email is empty
+    when the server withholds it: seeing it requires organization
+    administrator rights and a realm policy that permits it, so run
+    this with an admin's credentials (e.g. the user persona) to get
+    real addresses.
+    """
     users_list_command(
         _get_client_from_context(ctx),
         SimpleNamespace(
@@ -1633,6 +1642,20 @@ def _users_list_handler(
             include_deactivated=include_deactivated,
         ),
     )
+@
+
+The docstring names the columns, and in particular explains the one
+that is so often empty: a blank delivery email is the server
+withholding the address, not the command omitting a column, and the
+remedy (admin credentials, that is, the user persona) belongs in the
+help because that is where someone puzzled by the blank will look.
+
+<<test functions>>=
+def test_users_list_help_names_the_columns():
+    result = runner.invoke(app, ["users", "list", "--help"])
+
+    for needle in ("delivery", "administrator", "persona"):
+        assert needle in result.output
 @
 
 The implementation fetches all members through the shared resolver, so
@@ -2167,11 +2190,34 @@ def _users_invited_handler(
         ),
     ] = None,
 ):
-    """List pending (unaccepted) invitations."""
+    """List pending (unaccepted) invitations.
+
+    Each row has four tab-separated columns: the invitee email (or
+    the join URL for a reusable link), the expiry as ISO-8601 UTC
+    (empty when the invitation never expires), the role, and the
+    inviter's user ID. The server does not report which streams an
+    invitation carries, so the listing cannot show that.
+    """
     users_invited_command(
         _get_user_client_from_context(ctx),
         SimpleNamespace(patterns=patterns),
     )
+@
+
+The docstring names the columns because a bare TSV row does not:
+an empty expiry field is indistinguishable from a missing feature
+unless the help says what the field is and that empty means
+\enquote{never expires}.
+It also owns up to what the listing \emph{cannot} show---the server
+does not report an invitation's streams---so a reader stops looking
+for an option that cannot exist.
+
+<<test functions>>=
+def test_users_invited_help_names_the_columns():
+    result = runner.invoke(app, ["users", "invited", "--help"])
+
+    for needle in ("expiry", "role", "inviter", "streams"):
+        assert needle in result.output
 @
 
 An empty invitation list prints nothing, matching the silent
