@@ -143,6 +143,18 @@ streams. `--add-default-streams` defaults to on because the Zulip API's
 own defaults (`include_realm_default_subscriptions` false, `stream_ids`
 empty) subscribe an invitee to *nothing at all*.
 
+Server compatibility rules both requests (`_invitation_stream_fields`
+builds the stream fields for both verbs): `stream_ids` is **always**
+sent, even empty — the email endpoint requires the parameter and
+answers "Missing 'stream_ids' argument" without it (empty is legal
+since Zulip 7.0, FL 180). `include_realm_default_subscriptions` only
+exists since Zulip 9.0 (FL 261); on older servers (probed via
+`get_server_settings`, only when defaults are requested) the realm's
+default streams are resolved client-side (`get_streams` with
+`include_default=True`) and merged into `stream_ids`, and the flag is
+omitted. For `invite-link` on old servers this freezes the defaults at
+creation time instead of redemption time.
+
 `users revoke` and `users resend` take a **required** pattern argument.
 That is a safety property, not a style choice: `_matches_patterns`
 returns true for an empty pattern list, so an argument-less `revoke`

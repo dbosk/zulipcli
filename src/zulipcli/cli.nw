@@ -2605,6 +2605,86 @@ The latter is what makes one link per cohort possible---a
 guest link for one course and another for a second course, each
 seeing only its own streams.
 
+The flag is much younger than the endpoint, though, and pretending
+otherwise fails on real servers.
+[[include_realm_default_subscriptions]] exists only since Zulip~9.0
+(feature level~261); older servers silently ignore it, so relying on
+it alone quietly breaks [[--add-default-streams]] there.
+Worse, [[stream_ids]] is a required parameter of the email endpoint:
+omitting it---which an early version of this command did when no
+[[--stream]] was given, the common case---is answered with
+\enquote{Missing '[[stream_ids]]' argument} before the server looks
+at anything else.
+So two rules govern the request.
+First, [[stream_ids]] is always sent, even empty (an empty list is
+accepted since Zulip~7.0, feature level~180).
+Second, on servers that predate the flag we do what the API
+changelog tells clients of such servers to do: resolve the realm's
+default streams ourselves and merge them into [[stream_ids]].
+
+Whether the server knows the flag is a question about the server,
+answered by the public server-settings route.
+Servers too old to report a feature level at all are also too old
+for the flag, which is what makes defaulting to zero correct.
+
+<<constants>>=
+DEFAULTS_FLAG_FEATURE_LEVEL = 261
+<<functions>>=
+def _supports_default_subscriptions(client):
+    """Return whether the server knows the realm-defaults flag."""
+    settings = client.get_server_settings()
+    return (
+        settings.get("zulip_feature_level", 0)
+        >= DEFAULTS_FLAG_FEATURE_LEVEL
+    )
+@
+
+The realm's default streams are its streams filtered to
+\emph{only} the default ones: the stream-listing endpoint has
+carried the [[include_default]] filter far longer than the
+invitation endpoint has had its flag, so this works on every server
+the merge path serves.
+
+<<functions>>=
+def _realm_default_stream_ids(client):
+    """Return the stream IDs of the realm's default streams."""
+    result = _require_success(client.get_streams(
+        include_default=True,
+        include_public=False,
+        include_subscribed=False,
+    ))
+    return [stream["stream_id"] for stream in result["streams"]]
+@
+
+One helper builds the stream fields for both invitation verbs, so
+the two requests cannot drift apart.
+The server probe runs only when defaults were asked for: with
+[[--no-add-default-streams]] the answer would not change the
+request, so the caller should not pay a round trip for it.
+On the merge path the flag is omitted entirely---the old server
+would ignore it, and a request should not carry fields that do
+nothing.
+The requested streams come first and the defaults are deduplicated
+into them, so asking for a stream that happens to be a default does
+not subscribe anyone twice.
+
+<<functions>>=
+def _invitation_stream_fields(client, stream_ids, add_defaults):
+    """Return the stream-related fields of an invitation request."""
+    if add_defaults and not _supports_default_subscriptions(client):
+        merged = list(stream_ids)
+        merged += [
+            stream_id
+            for stream_id in _realm_default_stream_ids(client)
+            if stream_id not in merged
+        ]
+        return {"stream_ids": merged}
+    return {
+        "stream_ids": stream_ids,
+        "include_realm_default_subscriptions": add_defaults,
+    }
+@
+
 [[invite_expires_in_minutes]] is still omitted when unset, because
 there the server's own default (ten days) is a real policy worth
 deferring to.
@@ -2617,13 +2697,12 @@ def users_invite_command(client, args):
     request = {
         "invitee_emails": "\n".join(args.emails),
         "invite_as": _INVITE_ROLE_CODES[args.invite_as.value],
-        "include_realm_default_subscriptions":
-            args.add_default_streams,
+        **_invitation_stream_fields(
+            client, stream_ids, args.add_default_streams
+        ),
     }
     if args.expires_in is not None:
         request["invite_expires_in_minutes"] = args.expires_in
-    if stream_ids:
-        request["stream_ids"] = stream_ids
 
     _require_invite_success(client.call_endpoint(
         url="invites",
@@ -2634,10 +2713,15 @@ def users_invite_command(client, args):
 
 Let's verify the minimal happy path: a single invitee, default role,
 no streams, no explicit expiry.
+Even this minimal request carries an explicit empty [[stream_ids]],
+because the endpoint demands the parameter.
 
 <<test functions>>=
 def test_users_invite_sends_minimal_request():
     client = MagicMock()
+    client.get_server_settings.return_value = {
+        "zulip_feature_level": 261,
+    }
     client.call_endpoint.return_value = {"result": "success"}
 
     users_invite_command(
@@ -2658,14 +2742,93 @@ def test_users_invite_sends_minimal_request():
             "invitee_emails": "new@example.com",
             "invite_as": 400,
             "include_realm_default_subscriptions": True,
+            "stream_ids": [],
         },
     )
     client.get_stream_id.assert_not_called()
 @
 
+On a server that predates the realm-defaults flag, the same
+invocation resolves the realm's default streams itself and sends
+them as [[stream_ids]]---and the useless flag stays out of the
+request.
+
+<<test functions>>=
+def test_users_invite_merges_defaults_on_older_servers():
+    client = MagicMock()
+    client.get_server_settings.return_value = {
+        "zulip_feature_level": 180,
+    }
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [{"stream_id": 3}, {"stream_id": 7}],
+    }
+    client.call_endpoint.return_value = {"result": "success"}
+
+    users_invite_command(
+        client,
+        SimpleNamespace(
+            emails=["new@example.com"],
+            invite_as=InviteRole.member,
+            expires_in=None,
+            streams=[],
+            add_default_streams=True,
+        ),
+    )
+
+    client.get_streams.assert_called_once_with(
+        include_default=True,
+        include_public=False,
+        include_subscribed=False,
+    )
+    client.call_endpoint.assert_called_once_with(
+        url="invites",
+        method="POST",
+        request={
+            "invitee_emails": "new@example.com",
+            "invite_as": 400,
+            "stream_ids": [3, 7],
+        },
+    )
+@
+
+A requested stream that is also a realm default appears once, and
+the requested streams keep their position at the front.
+
+<<test functions>>=
+def test_users_invite_deduplicates_requested_and_default_streams():
+    client = MagicMock()
+    client.get_server_settings.return_value = {}
+    client.get_stream_id.return_value = {
+        "result": "success",
+        "stream_id": 7,
+    }
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [{"stream_id": 3}, {"stream_id": 7}],
+    }
+    client.call_endpoint.return_value = {"result": "success"}
+
+    users_invite_command(
+        client,
+        SimpleNamespace(
+            emails=["new@example.com"],
+            invite_as=InviteRole.member,
+            expires_in=None,
+            streams=["general"],
+            add_default_streams=True,
+        ),
+    )
+
+    request = client.call_endpoint.call_args.kwargs["request"]
+    assert request["stream_ids"] == [7, 3]
+@
+
 A batch call with role, expiry, and several streams should resolve
 each stream name in order and encode the streams as a
 [[stream_ids]] list.
+With [[--no-add-default-streams]] the server probe must not run:
+the request is the same on every server, so no round trip is owed.
 
 <<test functions>>=
 def test_users_invite_resolves_streams_and_role():
@@ -2698,6 +2861,7 @@ def test_users_invite_resolves_streams_and_role():
             "stream_ids": [7, 11],
         },
     )
+    client.get_server_settings.assert_not_called()
 @
 
 An unknown stream aborts before the invitation is posted.
@@ -2735,6 +2899,9 @@ same way the listing command does.
 <<test functions>>=
 def test_users_invite_reports_permission_error(capsys):
     client = MagicMock()
+    client.get_server_settings.return_value = {
+        "zulip_feature_level": 261,
+    }
     client.call_endpoint.return_value = {
         "result": "error",
         "msg": "Must be an organization administrator",
@@ -2805,6 +2972,16 @@ The response carries the URL, and we print that alone on stdout so the
 command composes---piped into [[xclip]], captured by a shell
 variable, or pasted into a course page.
 
+The stream fields come from the same helper as the email
+invitations, which is where the old-server semantics deserve one
+honest sentence: on a server without the realm-defaults flag, the
+defaults are resolved and frozen into the link at creation time,
+whereas a new server resolves them when each invitee redeems the
+link.
+Creation-time defaults are the closest approximation the old API
+can express, and for a link scoped to a cohort the set is stable
+anyway.
+
 <<functions>>=
 def users_invite_link_command(client, args):
     """Create a reusable invitation link and print it."""
@@ -2812,13 +2989,12 @@ def users_invite_link_command(client, args):
 
     request = {
         "invite_as": _INVITE_ROLE_CODES[args.invite_as.value],
-        "include_realm_default_subscriptions":
-            args.add_default_streams,
+        **_invitation_stream_fields(
+            client, stream_ids, args.add_default_streams
+        ),
     }
     if args.expires_in is not None:
         request["invite_expires_in_minutes"] = args.expires_in
-    if stream_ids:
-        request["stream_ids"] = stream_ids
 
     result = _require_invite_success(client.call_endpoint(
         url="invites/multiuse",
@@ -2840,6 +3016,9 @@ Let's verify the minimal call: default role, no streams, no expiry.
 <<test functions>>=
 def test_users_invite_link_sends_minimal_request(capsys):
     client = MagicMock()
+    client.get_server_settings.return_value = {
+        "zulip_feature_level": 261,
+    }
     client.call_endpoint.return_value = {
         "result": "success",
         "invite_link": "https://chat.example.com/join/abc/",
@@ -2861,9 +3040,50 @@ def test_users_invite_link_sends_minimal_request(capsys):
         request={
             "invite_as": 400,
             "include_realm_default_subscriptions": True,
+            "stream_ids": [],
         },
     )
     client.get_stream_id.assert_not_called()
+    assert capsys.readouterr().out == (
+        "https://chat.example.com/join/abc/\n"
+    )
+@
+
+On an old server the link freezes the realm's defaults at creation
+time---the closest the old API comes to the flag's
+defaults-at-redemption semantics.
+
+<<test functions>>=
+def test_users_invite_link_freezes_defaults_on_older_servers(capsys):
+    client = MagicMock()
+    client.get_server_settings.return_value = {}
+    client.get_streams.return_value = {
+        "result": "success",
+        "streams": [{"stream_id": 3}],
+    }
+    client.call_endpoint.return_value = {
+        "result": "success",
+        "invite_link": "https://chat.example.com/join/abc/",
+    }
+
+    users_invite_link_command(
+        client,
+        SimpleNamespace(
+            invite_as=InviteRole.member,
+            expires_in=None,
+            streams=[],
+            add_default_streams=True,
+        ),
+    )
+
+    client.call_endpoint.assert_called_once_with(
+        url="invites/multiuse",
+        method="POST",
+        request={
+            "invite_as": 400,
+            "stream_ids": [3],
+        },
+    )
     assert capsys.readouterr().out == (
         "https://chat.example.com/join/abc/\n"
     )
@@ -2940,6 +3160,9 @@ credential hint rather than the server's bare wording.
 <<test functions>>=
 def test_users_invite_link_hints_when_the_key_is_a_bot(capsys):
     client = MagicMock()
+    client.get_server_settings.return_value = {
+        "zulip_feature_level": 261,
+    }
     client.call_endpoint.return_value = {
         "result": "error",
         "code": "BAD_REQUEST",
