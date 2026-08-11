@@ -618,6 +618,191 @@ def _require_success(result):
 @
 
 
+\section{Printing rows}
+\label{sec:print-rows}
+
+Most of what this CLI prints is a table of strings: users, pending
+invitations, streams, topics, unread counts, indexed terms.  Those
+listings have two audiences that want incompatible things.  A person at
+a terminal wants aligned columns under labelled headers; a pipeline
+wants headerless tab-separated fields it can hand straight to
+[[cut -f2]] without stripping decoration first.
+
+One helper serves both, and routing every listing through it is what
+keeps the piped form stable.  The tab-separated branch is written
+exactly once, so no command can drift into a different separator, and
+none can start emitting a header line that every downstream script
+would then have to learn to skip.  Deciding this per command is how a
+tool ends up with output that is almost, but not quite, uniform.
+
+<<functions>>=
+def _print_rows(headers, rows, tty_rows=None):
+    """Print `rows` as a table on a terminal, as TSV otherwise.
+
+    `headers` labels the columns on a terminal only.  `rows` holds
+    equal-length tuples of strings and is what a pipeline receives,
+    one tab-separated line each.  `tty_rows`, when given, replaces
+    `rows` on the terminal branch alone.  Nothing at all is printed
+    when there are no rows.
+    """
+    if not rows:
+        return
+    if _stdout_is_tty():
+        table = Table(box=None, show_edge=False)
+        for header in headers:
+            table.add_column(
+                header,
+                justify="right" if header in COUNT_HEADERS else "left",
+            )
+        for row in rows if tty_rows is None else tty_rows:
+            table.add_row(*row)
+        Console(file=sys.stdout).print(table)
+    else:
+        for row in rows:
+            print("\t".join(row))
+@
+
+Splitting [[rows]] from [[tty_rows]] is the whole point of the
+signature.  An empty cell carries information to a script---an absent
+delivery address is testable as emptiness, and [[cut -f3]] still finds
+a field in that position---but on screen the same blank looks like the
+command forgot to fill it in.  A caller can therefore spell the blank
+out for the terminal, \enquote{(withheld)} or \enquote{never}, while
+the piped bytes stay exactly what they always were.  A caller with
+nothing to spell out passes [[rows]] alone and both audiences see the
+same cells.
+
+Alignment follows the header text instead of a per-call argument,
+because the only columns worth right-aligning are counts, and a count
+reads the same wherever it turns up.  Naming those headers in one place
+means two listings cannot disagree about where a number sits in its
+column, and a listing added later gets it right by calling its column
+[[Hits]] rather than by remembering an extra argument at the call site.
+
+<<constants>>=
+COUNT_HEADERS = {"Unread", "Hits"}
+@
+
+Not everything the CLI writes is a row, and the rest deliberately stays
+a plain [[print]].  A lone value---the URL from
+[[users invite-link]]---composes better bare than as a one-column table
+with a header floating above it.  The previews that [[users revoke]]
+and [[users resend]] show before acting, the recipient confirmation in
+[[send]], and the [[bot]] worker's progress notes all go to stderr,
+which is a channel for a human and never read as structured data.
+
+Let's verify the piped branch first, since it is the one under a
+compatibility promise.
+
+<<test functions>>=
+def test_print_rows_uses_tsv_when_stdout_not_tty(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    cli._print_rows(["Stream", "Unread"], [
+        ("general", "3"),
+        ("random", "too many"),
+    ])
+
+    assert capsys.readouterr().out == (
+        "general\t3\n"
+        "random\ttoo many\n"
+    )
+@
+
+A pipeline must see [[rows]] even when the caller offered prettier
+cells, or the substitution would leak into the bytes scripts parse.
+
+<<test functions>>=
+def test_print_rows_ignores_tty_rows_when_stdout_not_tty(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
+
+    cli._print_rows(
+        ["Name", "Delivery email"],
+        [("Alice", "")],
+        [("Alice", "(withheld)")],
+    )
+
+    assert capsys.readouterr().out == "Alice\t\n"
+@
+
+The terminal branch builds a Rich table rather than printing, so the
+tests that exercise it install a stand-in [[Console]] and inspect the
+table it was handed.  Every such test needs the same stand-in, so we
+build it once.
+
+<<test functions>>=
+def _capture_printed_table(monkeypatch):
+    """Capture the table `_print_rows` prints on a terminal."""
+    seen = {}
+
+    class FakeConsole:
+        def __init__(self, *, file):
+            seen["file"] = file
+
+        def print(self, table):
+            seen["headers"] = [
+                column.header for column in table.columns
+            ]
+            seen["cells"] = [
+                list(column._cells) for column in table.columns
+            ]
+            seen["justify"] = [
+                column.justify for column in table.columns
+            ]
+            seen["box"] = table.box
+            seen["show_edge"] = table.show_edge
+
+    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(cli, "Console", FakeConsole)
+    return seen
+@
+
+<<test functions>>=
+def test_print_rows_uses_rich_table_on_tty(monkeypatch):
+    seen = _capture_printed_table(monkeypatch)
+
+    cli._print_rows(["Topic", "Unread"], [("Lab 1", "2")])
+
+    assert seen["file"] is cli.sys.stdout
+    assert seen["headers"] == ["Topic", "Unread"]
+    assert seen["cells"] == [["Lab 1"], ["2"]]
+    assert seen["justify"] == ["left", "right"]
+    assert seen["box"] is None
+    assert seen["show_edge"] is False
+@
+
+<<test functions>>=
+def test_print_rows_prefers_tty_rows_on_a_terminal(monkeypatch):
+    seen = _capture_printed_table(monkeypatch)
+
+    cli._print_rows(
+        ["Name", "Delivery email"],
+        [("Alice", "")],
+        [("Alice", "(withheld)")],
+    )
+
+    assert seen["cells"] == [["Alice"], ["(withheld)"]]
+@
+
+An empty listing prints nothing at all---not even the headers, which
+would otherwise announce a table with no rows in it.
+
+<<test functions>>=
+def test_print_rows_is_silent_when_empty(monkeypatch):
+    seen = _capture_printed_table(monkeypatch)
+
+    cli._print_rows(["Stream", "Unread"], [])
+
+    assert seen == {}
+@
+
+
 \section{Completion lookups}
 \label{sec:completion}
 
@@ -1626,9 +1811,11 @@ def _users_list_handler(
 ):
     """List users on the Zulip server.
 
-    Each row has three tab-separated columns: the full name, the
-    Zulip email (the address the API routes by), and the delivery
-    email (the user's real mailbox). The delivery email is empty
+    Each row has three columns: the full name, the Zulip email (the
+    address the API routes by), and the delivery email (the user's
+    real mailbox). The columns are tab-separated when the output is
+    piped, and rendered as a labelled table on a terminal. The
+    delivery email is empty -- shown as "(withheld)" on a terminal --
     when the server withholds it: seeing it requires organization
     administrator rights and a realm policy that permits it, so run
     this with an admin's credentials (e.g. the user persona) to get
@@ -1649,6 +1836,9 @@ that is so often empty: a blank delivery email is the server
 withholding the address, not the command omitting a column, and the
 remedy (admin credentials, that is, the user persona) belongs in the
 help because that is where someone puzzled by the blank will look.
+It also states which of the two output forms the reader is looking at,
+since that is the difference someone notices first when they append a
+[[| cat]] and the headers vanish.
 
 <<test functions>>=
 def test_users_list_help_names_the_columns():
@@ -1671,6 +1861,8 @@ def users_list_command(client, args):
         "patterns",
         getattr(args, "pattern", None),
     )
+    rows = []
+    tty_rows = []
     for member in _resolve_members_matching_patterns(
         client,
         pattern_strs,
@@ -1678,9 +1870,30 @@ def users_list_command(client, args):
         include_deactivated=args.include_deactivated,
     ):
         delivery = member.get("delivery_email") or ""
-        print(
-            f"{member['full_name']}\t{member['email']}\t{delivery}"
+        rows.append(
+            (member["full_name"], member["email"], delivery)
         )
+        tty_rows.append((
+            member["full_name"],
+            member["email"],
+            delivery or DELIVERY_WITHHELD,
+        ))
+    _print_rows(
+        ["Name", "Zulip email", "Delivery email"],
+        rows,
+        tty_rows,
+    )
+@
+
+The two row lists differ in exactly one cell.  A withheld delivery
+address must stay an empty field for a pipeline, because emptiness is
+what makes it detectable at all; on screen that same blank is the very
+thing the docstring above exists to explain, so the terminal spells it
+out rather than leaving the reader to guess whether the address is
+missing or merely hidden.
+
+<<constants>>=
+DELIVERY_WITHHELD = "(withheld)"
 @
 
 Let's build a small fixture that the three verbs share.
@@ -1866,6 +2079,56 @@ def test_users_list_delivery_email_column_empty_when_hidden(capsys):
         "diana@example.com",
         "",
     ]
+@
+
+The same user on a terminal is the contrast that shows the two forms
+apart: the field a script reads as empty is the one a reader is told
+about in words.
+
+<<test functions>>=
+def test_users_list_labels_a_withheld_delivery_email_on_tty(
+    monkeypatch,
+):
+    seen = _capture_printed_table(monkeypatch)
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+    args = SimpleNamespace(
+        pattern="diana",
+        include_bots=False,
+        include_deactivated=False,
+    )
+
+    users_list_command(client, args)
+
+    assert seen["headers"] == [
+        "Name",
+        "Zulip email",
+        "Delivery email",
+    ]
+    assert seen["cells"] == [
+        ["Diana Developer"],
+        ["diana@example.com"],
+        ["(withheld)"],
+    ]
+@
+
+A delivery address the server did report is left exactly as it came,
+so the substitution cannot be mistaken for a rewrite of every cell.
+
+<<test functions>>=
+def test_users_list_keeps_a_visible_delivery_email_on_tty(monkeypatch):
+    seen = _capture_printed_table(monkeypatch)
+    client = MagicMock()
+    client.get_users.return_value = _make_members()
+    args = SimpleNamespace(
+        pattern="alice",
+        include_bots=False,
+        include_deactivated=False,
+    )
+
+    users_list_command(client, args)
+
+    assert seen["cells"][2] == ["alice.admin@corp.example"]
 @
 
 <<test functions>>=
@@ -2192,11 +2455,14 @@ def _users_invited_handler(
 ):
     """List pending (unaccepted) invitations.
 
-    Each row has four tab-separated columns: the invitee email (or
-    the join URL for a reusable link), the expiry as ISO-8601 UTC
-    (empty when the invitation never expires), the role, and the
-    inviter's user ID. The server does not report which streams an
-    invitation carries, so the listing cannot show that.
+    Each row has four columns: the invitee email (or the join URL for
+    a reusable link), the expiry as ISO-8601 UTC, the role, and the
+    inviter's user ID. The columns are tab-separated when the output
+    is piped, and rendered as a labelled table on a terminal. An
+    invitation that never expires has an empty expiry field when
+    piped, shown as "never" on a terminal. The server does not report
+    which streams an invitation carries, so the listing cannot show
+    that.
     """
     users_invited_command(
         _get_user_client_from_context(ctx),
@@ -2211,6 +2477,10 @@ unless the help says what the field is and that empty means
 It also owns up to what the listing \emph{cannot} show---the server
 does not report an invitation's streams---so a reader stops looking
 for an option that cannot exist.
+Since the same rows appear in two shapes, the help says which shape
+belongs to which destination; otherwise a reader who has only ever
+seen the table would have no reason to expect the empty field a
+script must handle.
 
 <<test functions>>=
 def test_users_invited_help_names_the_columns():
@@ -2233,31 +2503,62 @@ def users_invited_command(client, args):
     )
     patterns = _compile_patterns(pattern_strs)
 
+    rows = []
+    tty_rows = []
     for invite in sorted(_fetch_invitations(client),
                          key=_invite_sort_key):
         if not _matches_patterns([_invite_handle(invite)], patterns):
             continue
-        print(_format_invitation_row(invite))
+        handle, expiry, role, inviter = _invitation_row(invite)
+        rows.append((handle, expiry, role, inviter))
+        tty_rows.append((
+            handle,
+            expiry or INVITE_NEVER_EXPIRES,
+            role,
+            inviter,
+        ))
+    _print_rows(
+        ["Invitee or link", "Expires", "Role", "Invited by"],
+        rows,
+        tty_rows,
+    )
 @
 
-A row is four tab-separated columns: the handle, the expiry as
-ISO-8601 UTC, the role label rather than Zulip's integer, and the
-inviter.
-Expiry has two shapes to handle.
-[[None]] represents a never-expiring invitation and prints the empty
-string so downstream [[cut -f]] callers still see the same four field
-positions; an integer is a Unix timestamp and renders as UTC ISO-8601
-to match the format already produced by the [[read]] command.
+An empty expiry means \enquote{never}, and that is the second place
+where the piped and the printed form part company.
+The empty field has to survive into a pipeline, because holding the
+column count at four is the promise every [[cut -f]] caller depends
+on; a reader at a terminal gains nothing from a gap and is simply told
+the word.
 
-Holding the column count at four is what keeps that promise intact now
-that links appear too.
+<<constants>>=
+INVITE_NEVER_EXPIRES = "never"
+@
+
+A row is four columns: the handle, the expiry as ISO-8601 UTC, the
+role label rather than Zulip's integer, and the inviter.
+Building it as a tuple rather than a joined string is what lets the
+same four values reach both destinations; the tab separator now lives
+in [[_print_rows]] alone, which is the only place that knows whether
+tabs are wanted at all.
+
+Expiry has two shapes to handle.
+[[None]] represents a never-expiring invitation and becomes the empty
+string; an integer is a Unix timestamp and renders as UTC ISO-8601 to
+match the format already produced by the [[read]] command.
+The inviter is a Zulip user ID, so it is stringified here rather than
+at the join: a tuple of columns that is only sometimes all strings
+would push that conversion onto every caller.
+
+Holding the column count at four is what keeps the [[cut -f]] promise
+intact now that links appear too.
 A link has no email address to put in the first column, so it prints
 its URL there instead---the column means \enquote{whatever names this
 invitation}, and every existing [[cut -f1]] caller keeps working.
 
 <<functions>>=
-def _format_invitation_row(invite):
-    """Format one invitation as a tab-separated row."""
+def _invitation_row(invite):
+    """Return one invitation as a tuple of four column strings."""
     expiry = invite.get("expiry_date")
     if expiry is None:
         expiry_iso = ""
@@ -2270,7 +2571,7 @@ def _format_invitation_row(invite):
     role_label = _INVITE_ROLE_LABELS.get(role_code, str(role_code))
     inviter = invite.get("invited_by_user_id", "")
     handle = _invite_handle(invite)
-    return f"{handle}\t{expiry_iso}\t{role_label}\t{inviter}"
+    return (handle, expiry_iso, role_label, str(inviter))
 @
 
 Let's verify the success path with both kinds present: a dated email
@@ -2339,6 +2640,32 @@ def test_users_invited_always_prints_four_columns(capsys):
 
     for row in capsys.readouterr().out.strip().split("\n"):
         assert len(row.split("\t")) == 4
+@
+
+On a terminal the same fixture gains headers, and the two invitations
+that never expire say so where a pipeline sees an empty field.
+The dated one is left alone, which is what distinguishes filling a gap
+from rewriting a column.
+
+<<test functions>>=
+def test_users_invited_labels_never_expiring_rows_on_tty(monkeypatch):
+    seen = _capture_printed_table(monkeypatch)
+    client = MagicMock()
+    client.call_endpoint.return_value = _make_invitations()
+
+    users_invited_command(client, SimpleNamespace(patterns=None))
+
+    assert seen["headers"] == [
+        "Invitee or link",
+        "Expires",
+        "Role",
+        "Invited by",
+    ]
+    assert seen["cells"][1] == [
+        "never",
+        "1970-01-01T00:00:00+00:00",
+        "never",
+    ]
 @
 
 A URL fragment selects a link, which is how [[users revoke]] will name
@@ -3292,12 +3619,16 @@ The preview goes to stderr so that stdout stays usable in a pipeline,
 and a non-interactive stdin refuses outright rather than assuming
 consent---a script that fans out unexpectedly is exactly the case
 where the mistake is most expensive.
+That is also why the preview joins the columns itself instead of
+handing them to [[_print_rows]]: that helper picks its form by looking
+at \emph{stdout}, so a preview routed through it would gain or lose
+its headers according to the state of a stream it does not write to.
 
 <<functions>>=
 def _confirm_invitations(invites, *, action, assume_yes):
     """Confirm acting on more than one matched invitation."""
     for invite in invites:
-        print(_format_invitation_row(invite), file=sys.stderr)
+        print("\t".join(_invitation_row(invite)), file=sys.stderr)
     if assume_yes:
         return True
     stdin_is_tty = getattr(sys.stdin, "isatty", None)
@@ -4414,29 +4745,6 @@ def _format_unread_count(count, old_unreads_missing):
     return str(count)
 @
 
-Interactive terminals benefit from aligned columns and headers, while
-pipelines benefit from headerless tab-separated output. The unread-listing
-commands therefore render a borderless Rich table on a TTY and plain TSV
-everywhere else, preserving the silent \enquote{no results} convention
-when there is nothing to print.
-
-<<functions>>=
-def _print_unread_rows(name_header, rows):
-    """Print unread rows for the current stdout."""
-    if not rows:
-        return
-    if _stdout_is_tty():
-        table = Table(box=None, show_edge=False)
-        table.add_column(name_header)
-        table.add_column("Unread", justify="right")
-        for name, count in rows:
-            table.add_row(name, count)
-        Console(file=sys.stdout).print(table)
-    else:
-        for name, count in rows:
-            print(f"{name}\t{count}")
-@
-
 Let's verify that the unread snapshot helper groups counts by
 stream/topic, preserves the truncation flag, and deregisters the
 temporary queue.
@@ -4529,71 +4837,6 @@ def test_get_unread_topics_by_stream_reports_register_errors(capsys):
     client.deregister.assert_not_called()
 @
 
-<<test functions>>=
-def test_print_unread_rows_uses_tsv_when_stdout_not_tty(
-    capsys,
-    monkeypatch,
-):
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: False)
-
-    cli._print_unread_rows("Stream", [
-        ("general", "3"),
-        ("random", "too many"),
-    ])
-
-    assert capsys.readouterr().out == (
-        "general\t3\n"
-        "random\ttoo many\n"
-    )
-@
-
-<<test functions>>=
-def test_print_unread_rows_uses_rich_table_on_tty(monkeypatch):
-    seen = {}
-
-    class FakeConsole:
-        def __init__(self, *, file):
-            seen["file"] = file
-
-        def print(self, table):
-            seen["headers"] = [column.header for column in table.columns]
-            seen["cells"] = [
-                list(column._cells) for column in table.columns
-            ]
-            seen["box"] = table.box
-            seen["show_edge"] = table.show_edge
-
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
-    monkeypatch.setattr(cli, "Console", FakeConsole)
-
-    cli._print_unread_rows("Topic", [("Lab 1", "2")])
-
-    assert seen["file"] is cli.sys.stdout
-    assert seen["headers"] == ["Topic", "Unread"]
-    assert seen["cells"] == [["Lab 1"], ["2"]]
-    assert seen["box"] is None
-    assert seen["show_edge"] is False
-@
-
-<<test functions>>=
-def test_print_unread_rows_is_silent_when_empty(monkeypatch):
-    called = {}
-
-    class FakeConsole:
-        def __init__(self, *, file):
-            called["constructed"] = True
-
-        def print(self, table):
-            called["printed"] = True
-
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
-    monkeypatch.setattr(cli, "Console", FakeConsole)
-
-    cli._print_unread_rows("Stream", [])
-
-    assert called == {}
-@
-
 
 \section{The \texttt{streams} subcommand}
 
@@ -4634,6 +4877,11 @@ The unread view uses the unread summary helper above and sums per-topic
 counts back into per-stream counts, because Zulip reports unread channel
 state one topic at a time.
 
+Both views hand their rows to [[_print_rows]]
+(\cref{sec:print-rows}), which is why the plain listing gains a header
+on a terminal without changing anything a pipeline sees: joining a
+one-element tuple with tabs yields the name and nothing else.
+
 <<functions>>=
 def streams_command(client, args):
     """List available streams."""
@@ -4665,14 +4913,18 @@ def streams_command(client, args):
                     old_unreads_missing,
                 ),
             ))
-        _print_unread_rows("Stream", rows)
+        _print_rows(["Stream", "Unread"], rows)
         return
 
-    for stream in sorted(result["streams"],
-                         key=lambda s: s["name"]):
-        if not _matches_patterns([stream["name"]], patterns):
-            continue
-        print(stream["name"])
+    _print_rows(
+        ["Stream"],
+        [
+            (stream["name"],)
+            for stream in sorted(result["streams"],
+                                 key=lambda s: s["name"])
+            if _matches_patterns([stream["name"]], patterns)
+        ],
+    )
 @
 
 Let's verify the streams command filters correctly.
@@ -4919,7 +5171,9 @@ the same validation step, but then reuses the unread summary helper
 rather than calling [[get_stream_topics()]], because only the summary
 carries unread membership and counts.
 We sort both output modes alphabetically so repeated invocations remain
-stable and easy to pipe through other tools.
+stable and easy to pipe through other tools, and both modes print
+through [[_print_rows]] (\cref{sec:print-rows}) so that a terminal gets
+a header the pipeline never sees.
 
 <<functions>>=
 def topics_command(client, args):
@@ -4941,13 +5195,19 @@ def topics_command(client, args):
                     old_unreads_missing,
                 ),
             ))
-        _print_unread_rows("Topic", rows)
+        _print_rows(["Topic", "Unread"], rows)
         return
 
     result = _require_success(client.get_stream_topics(stream_id))
 
-    for topic in sorted(result["topics"], key=lambda t: t["name"]):
-        print(topic["name"])
+    _print_rows(
+        ["Topic"],
+        [
+            (topic["name"],)
+            for topic in sorted(result["topics"],
+                                key=lambda t: t["name"])
+        ],
+    )
 @
 
 Let's verify that topic listing resolves the stream name and sorts the
@@ -6599,6 +6859,14 @@ def _format_search_hit(message):
     ])
 @
 
+That same guarantee is why search alone keeps printing its own lines
+instead of going through [[_print_rows]] (\cref{sec:print-rows}).
+A hit's last column is up to [[SEARCH_SNIPPET_WIDTH]] characters of
+free-form message text, and a table would wrap it over as many screen
+lines as it needs---turning the one line per hit that this formatter
+exists to guarantee back into the several apparent rows it was written
+to prevent.
+
 \subsection{Running the search}
 
 The command merges before it prints, which is why it does not simply
@@ -7232,6 +7500,13 @@ Stdout stays a clean stream of data rows, so a caller can pipe [[terms]]
 into another tool without having to strip an advisory line, and an
 empty vocabulary is a normal state rather than a failure.
 
+Only the bare listing is a table.
+The lookup answer is a small report with its own headings---[[similar:]]
+and [[co-occurring with X:]]---so its rows are already labelled by the
+prose above them, and a second, columnar header inside each section
+would say the same thing twice.
+Those two sections therefore keep their own printer.
+
 <<functions>>=
 def _print_term_rows(rows):
     """Print term and count pairs as tab-separated lines."""
@@ -7248,7 +7523,13 @@ def terms_command(client, args):
         return
 
     if not args.query:
-        _print_term_rows(vocabulary[:args.limit])
+        _print_rows(
+            ["Term", "Hits"],
+            [
+                (term, str(hits))
+                for term, hits in vocabulary[:args.limit]
+            ],
+        )
         return
 
     similar = _rank_similar_terms(

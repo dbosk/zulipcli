@@ -86,12 +86,18 @@ The CLI is implemented with Typer and Rich in `src/zulipcli/cli.nw`.
 Current user-facing commands are:
 
 - `users list`: list users, filterable by one or more regexes over
-  name/Zulip email/delivery email.
+  name/Zulip email/delivery email. Three columns: aligned under
+  `Name`/`Zulip email`/`Delivery email` on a terminal, unchanged
+  tab-separated fields when piped. A withheld delivery email reads
+  `(withheld)` on a terminal and stays an *empty* field when piped.
 - `users invited`: list pending (unaccepted) invitations, both emailed
-  ones and reusable links, filterable by one or more regexes. Output is
-  four tab-separated columns; column 1 is the invitee email for an
-  emailed invitation and the join URL for a link, and the regexes match
-  that column.
+  ones and reusable links, filterable by one or more regexes. Four
+  columns: aligned under `Invitee or link`/`Expires`/`Role`/`Invited
+  by` on a terminal, unchanged tab-separated fields when piped. Column
+  1 is the invitee email for an emailed invitation and the join URL for
+  a link, and the regexes match that column. A never-expiring
+  invitation reads `never` on a terminal and stays an *empty* expiry
+  field when piped.
 - `users invite`: invite one or more users by email.
 - `users invite-link`: create a reusable invitation link and print the
   URL, so a cohort can be onboarded without knowing addresses in
@@ -110,8 +116,10 @@ Current user-facing commands are:
   conversation with that participant set; supports `-U/--unread` and
   `--mark-as-read`.
 - `streams`: list streams, filterable by one or more name regexes;
-  `-U/--unread` shows unread counts.
-- `topics`: list the topics inside a stream.
+  `-U/--unread` shows unread counts. Headed `Stream` (plus `Unread`)
+  on a terminal, bare names when piped.
+- `topics`: list the topics inside a stream. Headed `Topic` (plus
+  `Unread` with `-U`) on a terminal, bare names when piped.
 - `read`: read stream/topic history; supports `-U/--unread` and
   `--mark-as-read`.
 - `search`: full-text search over message history. Repeatable
@@ -126,9 +134,31 @@ Current user-facing commands are:
   It deliberately has no `--mark-as-read`.
 - `terms`: look up the realm's vocabulary in the local index, showing
   similar terms and terms that co-occur with the best match; with no
-  argument it lists the most frequent terms.
+  argument it lists the most frequent terms. Only that bare listing is
+  a table (`Term`/`Hits` on a terminal, TSV when piped) — the lookup's
+  `similar:` and `co-occurring with X:` sections keep their own
+  printer, since their text headings already label the rows.
 - `bot`: run an external worker command, given after `--`, whenever
   unread messages exist, feeding those messages to it on stdin.
+
+Every row-shaped stdout listing goes through one helper,
+`_print_rows(headers, rows, tty_rows=None)`. On a TTY it prints a
+borderless Rich table with headers; otherwise it prints `rows` as
+headerless TSV, and prints nothing at all when there are no rows.
+`rows` is the piped output verbatim, so **the non-TTY bytes are a
+compatibility promise** — the optional `tty_rows` exists precisely so
+that friendlier cells (`(withheld)`, `never`) never reach a pipeline.
+Columns headed `Unread` or `Hits` are right-aligned, via the
+`COUNT_HEADERS` set rather than a per-call argument. Add a listing by
+calling this helper; do not print rows yourself.
+
+Three kinds of output stay plain `print` on purpose: single values
+(the `users invite-link` URL), anything on stderr (the `users
+revoke`/`users resend` previews, the `send` recipient confirmation,
+`bot` worker notes) since `_print_rows` picks its form from *stdout*,
+and `search`'s one-line hits, whose free-form snippet column a table
+would wrap over several lines and so break the one-line-per-hit
+guarantee `_format_search_hit` exists to provide.
 
 `users invite` and `users invite-link` share their `--as`,
 `--expires-in`, `--stream`, and `--add-default-streams` options through
