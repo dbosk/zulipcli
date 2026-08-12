@@ -86,10 +86,27 @@ The CLI is implemented with Typer and Rich in `src/zulipcli/cli.nw`.
 Current user-facing commands are:
 
 - `users list`: list users, filterable by one or more regexes over
-  name/Zulip email/delivery email.
-- `users invited`: list pending (unaccepted) invitations (admin-only),
-  filterable by one or more invite-email regexes.
-- `users invite`: invite one or more users by email (admin-only).
+  name/Zulip email/delivery email. Three columns: aligned under
+  `Name`/`Zulip email`/`Delivery email` on a terminal, unchanged
+  tab-separated fields when piped. A withheld delivery email reads
+  `(withheld)` on a terminal and stays an *empty* field when piped.
+- `users invited`: list pending (unaccepted) invitations, both emailed
+  ones and reusable links, filterable by one or more regexes. Four
+  columns: aligned under `Invitee or link`/`Expires`/`Role`/`Invited
+  by` on a terminal, unchanged tab-separated fields when piped. Column
+  1 is the invitee email for an emailed invitation and the join URL for
+  a link, and the regexes match that column. A never-expiring
+  invitation reads `never` on a terminal and stays an *empty* expiry
+  field when piped.
+- `users invite`: invite one or more users by email.
+- `users invite-link`: create a reusable invitation link and print the
+  URL, so a cohort can be onboarded without knowing addresses in
+  advance.
+- `users revoke`: withdraw pending invitations of either kind, selected
+  by regex over the same column 1 that `users invited` prints.
+- `users resend`: send a pending email invitation again. Links cannot
+  be resent, so they are skipped with a note, and a match consisting
+  only of links is an error rather than a silent no-op.
 - `send`: send a stream message or a direct message; `--to` may be
   repeated, each regex is matched against name/Zulip email/delivery
   email, overlapping matches are deduplicated, and >1 match prompts
@@ -99,8 +116,10 @@ Current user-facing commands are:
   conversation with that participant set; supports `-U/--unread` and
   `--mark-as-read`.
 - `streams`: list streams, filterable by one or more name regexes;
-  `-U/--unread` shows unread counts.
-- `topics`: list the topics inside a stream.
+  `-U/--unread` shows unread counts. Headed `Stream` (plus `Unread`)
+  on a terminal, bare names when piped.
+- `topics`: list the topics inside a stream. Headed `Topic` (plus
+  `Unread` with `-U`) on a terminal, bare names when piped.
 - `read`: read stream/topic history; supports `-U/--unread` and
   `--mark-as-read`.
 - `search`: full-text search over message history. Repeatable
@@ -115,15 +134,149 @@ Current user-facing commands are:
   It deliberately has no `--mark-as-read`.
 - `terms`: look up the realm's vocabulary in the local index, showing
   similar terms and terms that co-occur with the best match; with no
-  argument it lists the most frequent terms.
+  argument it lists the most frequent terms. Only that bare listing is
+  a table (`Term`/`Hits` on a terminal, TSV when piped) — the lookup's
+  `similar:` and `co-occurring with X:` sections keep their own
+  printer, since their text headings already label the rows.
 - `bot`: run an external worker command, given after `--`, whenever
   unread messages exist, feeding those messages to it on stdin.
+
+Every row-shaped stdout listing goes through one helper,
+`_print_rows(headers, rows, tty_rows=None)`. On a TTY it prints a
+borderless Rich table with headers; otherwise it prints `rows` as
+headerless TSV, and prints nothing at all when there are no rows.
+`rows` is the piped output verbatim, so **the non-TTY bytes are a
+compatibility promise** — the optional `tty_rows` exists precisely so
+that friendlier cells (`(withheld)`, `never`) never reach a pipeline.
+Columns headed `Unread` or `Hits` are right-aligned, via the
+`COUNT_HEADERS` set rather than a per-call argument. Add a listing by
+calling this helper; do not print rows yourself.
+
+Three kinds of output stay plain `print` on purpose: single values
+(the `users invite-link` URL), anything on stderr (the `users
+revoke`/`users resend` previews, the `send` recipient confirmation,
+`bot` worker notes) since `_print_rows` picks its form from *stdout*,
+and `search`'s one-line hits, whose free-form snippet column a table
+would wrap over several lines and so break the one-line-per-hit
+guarantee `_format_search_hit` exists to provide.
+
+`users invite` and `users invite-link` share their `--as`,
+`--expires-in`, `--stream`, and `--add-default-streams` options through
+the `<<invitation options>>` and `<<invitation arguments>>` chunks.
+Add a shared option once and both commands get it; adding it to only
+one signature is the mistake those chunks exist to prevent.
+
+`--stream` alone *adds* to the organisation's default streams;
+`--stream` together with `--no-add-default-streams` specifies the
+subscription set exactly, which is how one link per cohort gets its own
+streams. `--add-default-streams` defaults to on because the Zulip API's
+own defaults (`include_realm_default_subscriptions` false, `stream_ids`
+empty) subscribe an invitee to *nothing at all*.
+
+Server compatibility rules both requests (`_invitation_stream_fields`
+builds the stream fields for both verbs): `stream_ids` is **always**
+sent, even empty — the email endpoint requires the parameter and
+answers "Missing 'stream_ids' argument" without it (empty is legal
+since Zulip 7.0, FL 180). `include_realm_default_subscriptions` only
+exists since Zulip 9.0 (FL 261); on older servers (probed via
+`get_server_settings`, only when defaults are requested) the realm's
+default streams are resolved client-side (`get_streams` with
+`include_default=True`) and merged into `stream_ids`, and the flag is
+omitted. For `invite-link` on old servers this freezes the defaults at
+creation time instead of redemption time.
+
+`users revoke` and `users resend` take a **required** pattern argument.
+That is a safety property, not a style choice: `_matches_patterns`
+returns true for an empty pattern list, so an argument-less `revoke`
+would destroy every pending invitation. Both prompt when more than one
+invitation matches, refuse rather than prompt on a non-TTY stdin, and
+accept `-y/--yes`.
 
 Shell completion is part of the CLI implementation.
 Completion for streams, topics, users, and indexed terms is generated
 by helper functions in `src/zulipcli/cli.nw`, so changes to command
 parameters and completion behavior should usually be kept together in
 that file.
+
+Two tests reach into framework internals and so are sensitive to
+dependency upgrades (see issue #13):
+
+- `test_click_completion_path_uses_context_for_zuliprc_and_stream`
+  imports `BashComplete` from `typer._completion_classes`. It must be
+  **Typer's** resolver, not `click.shell_completion`: Typer vendored
+  Click, and `TyperGroup` no longer subclasses `click.Group`, so
+  Click's `_resolve_context` takes its "not a group" branch, stops at
+  the root command, and silently returns no candidates for every
+  option.
+- `test_cli_shows_help_without_command` asserts exit code **2**, not 0.
+  Typer treats `no_args_is_help` as a usage error.
+
+## Credential Personas
+
+The Zulip invitation API rejects **every** bot API key, on all six
+invite endpoints, with HTTP 400 and
+`"This endpoint does not accept bot requests."`. The check is on the
+account kind and runs *before* any role check, so promoting a bot to
+organisation administrator does not help, and a bot cannot even *list*
+invitations. All five invitation commands therefore need a human
+account's key.
+
+Two personas, `user` and `bot`, each resolve independently:
+
+- File: `<active zuliprc>.<persona>` — used when it exists. The
+  active zuliprc is the one selected by `--zuliprc` or the embedding
+  host, defaulting to `~/.zuliprc`; the persona files are its
+  suffixed siblings (so `~/.zuliprc.user` in the default setup, or
+  e.g. `course/zuliprc.user` when a host supplies `course/zuliprc`).
+- Key: `ZULIP_USER_API_KEY` / `ZULIP_BOT_API_KEY`.
+- Address: `ZULIP_USER_EMAIL` / `ZULIP_BOT_EMAIL`.
+- Server: `ZULIP_SITE`, shared (the library reads it directly).
+
+Precedence for the file is `<active zuliprc>.<persona>` >
+`<active zuliprc>`. (Up to 0.8 the rule was the opposite for an
+explicit `--zuliprc`, and persona files were anchored to the home
+directory — which silently disabled persona files for embedding
+hosts, since a host always supplies a path.) The environment
+variables override *individual fields* of whichever file was chosen,
+because `zulip.Client` merges per field rather than per source — so
+a zuliprc holding only a non-secret email and site, plus a key in
+the environment, keeps secrets off disk entirely. Empty values count
+as unset.
+
+`_get_user_client_from_context()` is for the invitation commands;
+`_get_client_from_context()` is for everything else and picks
+`_default_persona()`, which prefers `user` over `bot` and returns
+`None` when neither is configured. That `None` is the backward
+compatibility guarantee: with no persona files and no persona
+variables, resolution is exactly what it was before personas existed.
+
+Three consequences worth knowing:
+
+- Once user credentials exist, `send` and `dm` post as *you*, not as
+  the bot. To act as the bot anyway, pass
+  `--zuliprc ~/.zuliprc.bot`.
+- The `bot` command is the exception to user-first: it uses
+  `_get_bot_client_from_context()`, which takes the bot persona when
+  configured and otherwise plain `~/.zuliprc` — never the human. A
+  worker that consumed the owner's unreads and marked them read would
+  be the worst possible default.
+- There is deliberately no `--user-zuliprc` root option; root options
+  belong to the embedding host, which is why `build_embedded_app()`
+  declares none. A test asserts the absence.
+
+This model is documented for *users* in the help texts, and the
+standalone and embedded forms carry different instructions. Three
+epilog constants in `cli.nw` hold that text: `CREDENTIALS_EPILOG`
+(standalone `--help`; mentions `--zuliprc`) and
+`EMBEDDED_CREDENTIALS_EPILOG` (embedded form; the host picks the file,
+and a host can replace the text via `build_embedded_app(epilog=...)`)
+share a `PERSONA_EPILOG` middle by concatenation, so the two forms
+cannot describe different persona models. The invitation commands
+share `INVITATION_HELP_EPILOG`, which must stay form-neutral (no
+`--zuliprc`) because the same command objects are registered on both
+apps. Tests pin all of this, including that `--zuliprc` is absent from
+the embedded help. When changing the credential model, change the
+epilogs with it.
 
 ## Term Index
 
@@ -143,6 +296,13 @@ loop goes through.
 - Writes are best-effort; any failure is swallowed so indexing can
   never break a read.
 - Disable with `ZULIPCLI_NO_TERM_INDEX=1`; reset by deleting the file.
+
+Environment variables the CLI reads, in one place:
+`ZULIPCLI_NO_TERM_INDEX`, `XDG_DATA_HOME`, `ZULIP_USER_API_KEY`,
+`ZULIP_USER_EMAIL`, `ZULIP_BOT_API_KEY`, `ZULIP_BOT_EMAIL`. `ZULIP_SITE`
+is read by the `zulip` library, not by this code. Note `ZULIP_CONFIG` is
+*not* honoured: `get_client()` always passes an explicit `config_file`,
+so the library never falls back to it.
 
 ## Practical Workflow
 
@@ -169,3 +329,12 @@ The term index adds no packaging change: `sqlite3` (storage), `difflib`
 (similarity), and `os` (the `XDG_DATA_HOME` lookup) are all standard
 library. Keep it that way — a vocabulary cache is not worth a fourth
 runtime dependency.
+
+The invitation lifecycle adds no dependency either. The `zulip` library
+exposes no invitation methods, so `invites`, `invites/multiuse`,
+`invites/{id}` and `invites/{id}/resend` all go through
+`client.call_endpoint()`. Pass native Python ints, bools, and lists in
+the request: `do_api_query` applies
+`val if isinstance(val, str) else json.dumps(val)` to every field, so
+`True` becomes JSON `true` — formatting it yourself with `str()` would
+produce `"True"` and fail the server's validator.
