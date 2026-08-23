@@ -98,7 +98,8 @@ Current user-facing commands are:
   a link, and the regexes match that column. A never-expiring
   invitation reads `never` on a terminal and stays an *empty* expiry
   field when piped.
-- `users invite`: invite one or more users by email.
+- `users invite`: invite one or more users by email; `--role`
+  (`-r`) sets the invitee's organisation role.
 - `users invite-link`: create a reusable invitation link and print the
   URL, so a cohort can be onboarded without knowing addresses in
   advance.
@@ -160,11 +161,14 @@ and `search`'s one-line hits, whose free-form snippet column a table
 would wrap over several lines and so break the one-line-per-hit
 guarantee `_format_search_hit` exists to provide.
 
-`users invite` and `users invite-link` share their `--as`,
+`users invite` and `users invite-link` share their `--role`,
 `--expires-in`, `--stream`, and `--add-default-streams` options through
 the `<<invitation options>>` and `<<invitation arguments>>` chunks.
 Add a shared option once and both commands get it; adding it to only
-one signature is the mistake those chunks exist to prevent.
+one signature is the mistake those chunks exist to prevent. The role
+flag was `--as` up to 0.9; it was renamed when `--as` became the
+persona option, because Click does not reject a duplicated option
+name — the later definition silently wins.
 
 `--stream` alone *adds* to the organisation's default streams;
 `--stream` together with `--no-add-default-streams` specifies the

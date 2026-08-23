@@ -2890,9 +2890,13 @@ def _users_invite_handler(
     )
 @
 
-The option name [[--as]] reads naturally but [[as]] is a Python
-keyword, so the parameter has to be [[invite_as]] and the alias is
-wired explicitly.
+The role option is [[--role]]; the parameter behind it is
+[[invite_as]], after the API field the value is sent as, and the alias
+is wired explicitly because the two names differ.
+(Up to version 0.9 the flag was [[--as]]; it moved when [[--as]] became
+the persona option of \cref{sec:personas}, which every command takes.
+The move was forced rather than cosmetic: Click does not reject a
+duplicated option name, so the later definition would simply have won.)
 [[--add-default-streams]] needs no such wiring: Typer derives the
 paired [[--no-add-default-streams]] form from any boolean parameter,
 which is the same treatment [[--include-bots]] already gets.
@@ -2901,8 +2905,8 @@ which is the same treatment [[--include-bots]] already gets.
 invite_as: Annotated[
     InviteRole,
     typer.Option(
-        "--as",
-        "-a",
+        "--role",
+        "-r",
         help="organisation role assigned to invitees",
     ),
 ] = InviteRole.member,
@@ -3577,7 +3581,7 @@ def test_users_invite_link_cli_passes_options(monkeypatch):
 
     result = runner.invoke(app, [
         "users", "invite-link",
-        "--as", "guest",
+        "--role", "guest",
         "--expires-in", "60",
         "-s", "general",
         "--no-add-default-streams",
