@@ -98,7 +98,8 @@ Current user-facing commands are:
   a link, and the regexes match that column. A never-expiring
   invitation reads `never` on a terminal and stays an *empty* expiry
   field when piped.
-- `users invite`: invite one or more users by email.
+- `users invite`: invite one or more users by email; `--role`
+  (`-r`) sets the invitee's organisation role.
 - `users invite-link`: create a reusable invitation link and print the
   URL, so a cohort can be onboarded without knowing addresses in
   advance.
@@ -160,11 +161,24 @@ and `search`'s one-line hits, whose free-form snippet column a table
 would wrap over several lines and so break the one-line-per-hit
 guarantee `_format_search_hit` exists to provide.
 
-`users invite` and `users invite-link` share their `--as`,
+`users invite` and `users invite-link` share their `--role`,
 `--expires-in`, `--stream`, and `--add-default-streams` options through
 the `<<invitation options>>` and `<<invitation arguments>>` chunks.
 Add a shared option once and both commands get it; adding it to only
-one signature is the mistake those chunks exist to prevent.
+one signature is the mistake those chunks exist to prevent. The role
+flag was `--as` up to 0.9; it was renamed when `--as` became the
+persona option, because Click does not reject a duplicated option
+name — the later definition silently wins.
+
+Every command takes `--as user|bot` to run as a named persona instead
+of its default. The option is declared once, in the `<<persona
+option>>` signature-fragment chunk, and referenced at the end of every
+handler signature; `test_every_command_declares_the_persona_option`
+walks both app forms and fails on a handler that forgot it. It is a
+per-command option, not a root one, so the embedded app carries it
+without the host doing anything. Its help text must stay form-neutral
+(no `--zuliprc`) and must not mention `ZULIP_USER_API_KEY`, which a
+test asserts is absent from `users list --help`.
 
 `--stream` alone *adds* to the organisation's default streams;
 `--stream` together with `--no-add-default-streams` specifies the
@@ -250,19 +264,31 @@ as unset.
 compatibility guarantee: with no persona files and no persona
 variables, resolution is exactly what it was before personas existed.
 
+All three getters take `persona=None`; a handler passes its `--as`
+value and `_chosen_persona(persona, zuliprc, default)` resolves it: an
+explicit persona wins and **must be configured** (otherwise
+`Error: no X persona is configured: expected <zuliprc>.X or
+ZULIP_X_API_KEY`, exit 1), `None` yields the getter's default with its
+silent fall-backs intact. `_chosen_persona` is also where the
+`Persona` enum member is unwrapped to its plain string — on Python
+3.11+ `f"{Persona.user}"` renders `Persona.user`, which would make
+`_persona_zuliprc` look for `.zuliprc.Persona.user`. Tests monkeypatch
+the getters as `lambda ctx, persona=None: ...`.
+
 Three consequences worth knowing:
 
 - Once user credentials exist, `send` and `dm` post as *you*, not as
-  the bot. To act as the bot anyway, pass
-  `--zuliprc ~/.zuliprc.bot`.
+  the bot. To act as the bot anyway, pass `--as bot`.
 - The `bot` command is the exception to user-first: it uses
   `_get_bot_client_from_context()`, which takes the bot persona when
-  configured and otherwise plain `~/.zuliprc` — never the human. A
-  worker that consumed the owner's unreads and marked them read would
-  be the worst possible default.
+  configured and otherwise plain `~/.zuliprc` — never the human by
+  default; only an explicit `bot --as user` runs it as you. A worker
+  that consumed the owner's unreads and marked them read would be the
+  worst possible default.
 - There is deliberately no `--user-zuliprc` root option; root options
   belong to the embedding host, which is why `build_embedded_app()`
-  declares none. A test asserts the absence.
+  declares none. A test asserts the absence. The per-command `--as`
+  is the override instead.
 
 This model is documented for *users* in the help texts, and the
 standalone and embedded forms carry different instructions. Three

@@ -230,17 +230,45 @@ is turned away.
 A single credential therefore cannot both drive a bot worker and
 invite anyone.
 
-Rather than add a flag that every affected command would have to
-thread through, we name the two roles a caller can act in.
+Rather than make every caller say which credentials each command
+should use, we name the two roles a caller can act in.
 A \emph{persona} is one such role; there are exactly two, and each
-command declares which one it needs.
+command declares which one it needs by default.
 Commands that talk to ordinary endpoints take whichever persona is
 configured, preferring the human; the invitation commands insist on
 the human one.
+The default is only a default: every command also takes
+[[--as user]] or [[--as bot]] to run as a named persona, which is
+introduced below once the defaults are in place.
 
 <<constants>>=
 USER_PERSONA = "user"
 BOT_PERSONA = "bot"
+@
+
+The same two names are what a caller may type after [[--as]], so they
+double as an [[Enum]]: Typer turns an [[Enum]] parameter into a
+validated choice with shell completion, and a third persona would be
+one more member.
+The members \emph{are} the constants, so the strings the command line
+accepts cannot drift from the strings the resolution below compares
+against.
+The mixed-in [[str]] base makes a member compare equal to its value
+([[Persona.user == "user"]]) but does \emph{not} make it format as
+its value: from Python~3.11 on, [[f"{Persona.user}"]] renders as
+[[Persona.user]], so a member that reached [[_persona_zuliprc]]
+unconverted would look for [[~/.zuliprc.Persona.user]] and report a
+configured persona as absent.
+The member is therefore unwrapped to its [[.value]] at a single point,
+[[_chosen_persona]] below, and everything past that point sees plain
+strings.
+
+<<functions>>=
+class Persona(str, Enum):
+    """The credential personas a command can run as."""
+
+    user = USER_PERSONA
+    bot = BOT_PERSONA
 @
 
 A persona is identified by a suffix on the configuration path in
@@ -393,7 +421,46 @@ def _client_for_persona(zuliprc, persona):
         _exit_with_error(str(error))
 @
 
-That leaves three entry points for command handlers.
+Each command has a default persona, but a default is not a mandate:
+the person at the keyboard may want to read as the bot to see what
+the worker sees, or run the worker as themselves once.
+So every handler takes an optional explicit persona and resolves it
+through one helper: an explicit choice wins, otherwise the command's
+default applies.
+An explicit persona must be configured.
+The defaults keep their silent fall-backs---a plain [[bot]] or a plain
+[[users invite]] on a one-file installation still uses that file---but
+someone who typed [[--as user]] named a set of credentials, and quietly
+substituting the bot's would be worse than stopping.
+The error names the file and the variable that would satisfy the
+request, the same hint the invitation commands give when the server
+refuses a bot.
+This is also the single point that turns a [[Persona]] member back
+into its plain string, so it accepts either form: the handlers hand it
+the member Typer parsed, and the tests hand it the bare constant.
+
+<<functions>>=
+def _chosen_persona(persona, zuliprc, default):
+    """Return the persona to run as: `persona` if given, else `default`.
+
+    An explicit `persona` must be configured beside `zuliprc`;
+    otherwise the command exits with an error naming the missing
+    file and variable.
+    """
+    if persona is None:
+        return default
+    persona = getattr(persona, "value", persona)
+    if not _persona_is_configured(persona, zuliprc):
+        base = zuliprc if zuliprc is not None else zulipcli.DEFAULT_ZULIPRC
+        _exit_with_error(
+            f"no {persona} persona is configured: expected "
+            f"{base}.{persona} or ZULIP_{persona.upper()}_API_KEY"
+        )
+    return persona
+@
+
+That leaves three entry points for command handlers, differing only in
+their default.
 Nearly every handler wants the first; the invitation commands, which
 the server would otherwise reject, ask for the second; and the [[bot]]
 worker asks for the third.
@@ -404,16 +471,25 @@ the persona against the default path while reading credentials beside
 the active one would let the two disagree.
 
 <<functions>>=
-def _get_client_from_context(ctx):
-    """Create a Zulip client from the current Typer context."""
+def _get_client_from_context(ctx, persona=None):
+    """Create a Zulip client from the current Typer context.
+
+    Runs as `persona` when given, else as the default persona.
+    """
     zuliprc = _get_root_zuliprc(ctx)
-    return _client_for_persona(zuliprc, _default_persona(zuliprc))
+    persona = _chosen_persona(persona, zuliprc, _default_persona(zuliprc))
+    return _client_for_persona(zuliprc, persona)
 @
 
 <<functions>>=
-def _get_user_client_from_context(ctx):
-    """Create a client for endpoints that reject bot API keys."""
-    return _client_for_persona(_get_root_zuliprc(ctx), USER_PERSONA)
+def _get_user_client_from_context(ctx, persona=None):
+    """Create a client for endpoints that reject bot API keys.
+
+    Runs as `persona` when given, else as the user persona.
+    """
+    zuliprc = _get_root_zuliprc(ctx)
+    persona = _chosen_persona(persona, zuliprc, USER_PERSONA)
+    return _client_for_persona(zuliprc, persona)
 @
 
 The [[bot]] worker is the one command where preferring the human would
@@ -421,28 +497,65 @@ work against the command's stated purpose: it polls unread messages,
 feeds them to an external process, and marks them read, and doing that
 to the \emph{owner's} mailbox because a user key happened to be
 configured would be an unpleasant surprise.
-So it never falls back to the human persona: the bot persona when
-configured, otherwise the plain [[zuliprc]]---which is exactly what
-the command used before personas existed.
+So its default never falls back to the human persona: the bot persona
+when configured, otherwise the plain [[zuliprc]]---which is exactly
+what the command used before personas existed.
+Only an explicit [[--as user]] runs the worker as the human, and then
+there is no surprise, because the caller asked for it.
 
 <<functions>>=
-def _get_bot_client_from_context(ctx):
-    """Create a client for the bot worker, never as the human."""
+def _get_bot_client_from_context(ctx, persona=None):
+    """Create a client for the bot worker, never the human by default.
+
+    Runs as `persona` when given, else as the bot persona when one is
+    configured and as the plain zuliprc otherwise.
+    """
     zuliprc = _get_root_zuliprc(ctx)
-    persona = (
+    default = (
         BOT_PERSONA
         if _persona_is_configured(BOT_PERSONA, zuliprc)
         else None
     )
-    return _client_for_persona(zuliprc, persona)
+    return _client_for_persona(
+        zuliprc,
+        _chosen_persona(persona, zuliprc, default),
+    )
 @
 
-There is deliberately no [[--user-zuliprc]] option to match.
+The explicit persona is an option on each command, not on the root
+application.
 Root options belong to whichever application owns the command line,
 and the embedded form below declares none at all so a host application
-can own them; adding one here would either break that contract or
-leave the two forms with different option sets.
-A caller who needs a one-off override already has [[--zuliprc]].
+can own them; a root option here would either break that contract or
+leave the two forms with different option sets, whereas an option on
+the command itself travels with the command into both forms.
+Typer reads options from the handler signature, so the option cannot
+be shared as a value; like the invitation options of
+\cref{sec:users}, it is shared as source text---one chunk that every
+handler references---and a test checks that every command in both
+forms declares it.
+The help text names neither [[--zuliprc]] nor any variable: it is
+printed in the embedded form too, where the host owns the file, and
+[[users list --help]] is pinned not to demand a persona.
+Completion callbacks keep following the default persona, as they
+already do for the invitation commands: offering candidates from the
+default account is the same silent approximation as before.
+
+<<persona option>>=
+persona: Annotated[
+    Optional[Persona],
+    typer.Option(
+        "--as",
+        help="run as this persona instead of the command's "
+             "default; the top-level --help explains how "
+             "personas are configured",
+    ),
+] = None,
+@
+
+There is still no [[--user-zuliprc]] option: [[--as]] selects among
+the persona files beside the active zuliprc, and a caller who needs a
+file from elsewhere already has [[--zuliprc]].
 
 None of these resolution rules is visible from the command line
 unless we print them.
@@ -480,8 +593,10 @@ PERSONA_EPILOG = (
     "Commands prefer the user persona, so once one is configured, "
     "messages are sent in your name. The invitation commands "
     "require it, because Zulip rejects bot API keys there. The "
-    "bot command never uses it: it runs as the bot persona, or "
-    "the plain zuliprc."
+    "bot command never uses it by default: it runs as the bot "
+    "persona, or the plain zuliprc. Every command also takes --as "
+    "user or --as bot to run as that persona instead, provided it "
+    "is configured."
 )
 CREDENTIALS_EPILOG = (
     "Credentials are read from a zuliprc file, by default "
@@ -1472,6 +1587,33 @@ def test_no_persona_zuliprc_option_is_declared():
     assert "--bot-zuliprc" not in options
 @
 
+The mirror image of that decision is that the per-command override must
+be on \emph{every} command, in both forms.
+Sharing the option as source text only guarantees that if every handler
+references the chunk, and this is what catches a handler that does not.
+
+<<test functions>>=
+def test_every_command_declares_the_persona_option():
+    def leaf_commands(command):
+        subcommands = getattr(command, "commands", {}).values()
+        if not subcommands:
+            return [command]
+        return [
+            leaf
+            for subcommand in subcommands
+            for leaf in leaf_commands(subcommand)
+        ]
+
+    for form in (app, cli.build_embedded_app()):
+        for command in leaf_commands(get_command(form)):
+            options = {
+                option
+                for param in command.params
+                for option in getattr(param, "opts", [])
+            }
+            assert "--as" in options, command.name
+@
+
 The [[bot]] worker must never end up with the human's credentials,
 even when only the human persona is configured---that is the case
 where the uniform default would silently consume the owner's unreads.
@@ -1572,6 +1714,112 @@ def test_ordinary_commands_use_the_default_persona(monkeypatch):
 
     assert result.exit_code == 0
     assert seen["persona"] is None
+@
+
+The override is the third case of the same harness: the command is
+held fixed and only [[--as]] varies, so the persona reaching
+[[_client_for_persona]] must change from the default to the named
+one---and arrive as the plain string, not the [[Enum]] member, which
+the [[str]] mix-in would let an equality assertion miss.
+
+<<test functions>>=
+def test_as_option_overrides_the_default_persona(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("ZULIP_BOT_API_KEY", "secret")
+    monkeypatch.setattr(cli, "streams_command", lambda client, args: None)
+    monkeypatch.setattr(
+        cli,
+        "_client_for_persona",
+        lambda zuliprc, persona:
+            seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, ["streams", "--as", "bot"])
+
+    assert result.exit_code == 0
+    assert seen["persona"] == cli.BOT_PERSONA
+    assert type(seen["persona"]) is str
+@
+
+<<test functions>>=
+def test_bot_command_can_run_as_the_user(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+    monkeypatch.setattr(cli, "bot_command", lambda client, args: None)
+    monkeypatch.setattr(
+        cli,
+        "_client_for_persona",
+        lambda zuliprc, persona:
+            seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, ["bot", "--as", "user", "--", "worker"])
+
+    assert result.exit_code == 0
+    assert seen["persona"] == cli.USER_PERSONA
+@
+
+The invitation commands take the override too, and beside it
+[[--role]] must keep meaning the invitee's role; this is the test that
+pins the two options apart.
+
+<<test functions>>=
+def test_invitation_commands_take_the_persona_override(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("ZULIP_BOT_API_KEY", "secret")
+    monkeypatch.setattr(
+        cli,
+        "users_invite_command",
+        lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_client_for_persona",
+        lambda zuliprc, persona:
+            seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, [
+        "users", "invite", "a@example.com",
+        "--role", "guest", "--as", "bot",
+    ])
+
+    assert result.exit_code == 0
+    assert seen["persona"] == cli.BOT_PERSONA
+    assert seen["args"].invite_as == InviteRole.guest
+@
+
+An explicit persona that nothing configures is an error, and the error
+must say what would have satisfied it.
+The [[isolated_personas]] fixture relocates the default zuliprc into
+[[tmp_path]], so the expected path is known exactly.
+
+<<test functions>>=
+def test_as_option_demands_a_configured_persona(tmp_path):
+    result = runner.invoke(app, ["streams", "--as", "bot"])
+
+    assert result.exit_code == 1
+    assert str(tmp_path / ".zuliprc.bot") in result.output
+    assert "ZULIP_BOT_API_KEY" in result.output
+@
+
+The helper itself is pinned on the two points that the command-level
+tests reach only indirectly: the member is unwrapped, and [[None]]
+yields the caller's default untouched.
+
+<<test functions>>=
+def test_chosen_persona_unwraps_the_enum(monkeypatch):
+    monkeypatch.setenv("ZULIP_USER_API_KEY", "secret")
+
+    persona = cli._chosen_persona(cli.Persona.user, None, None)
+
+    assert persona == cli.USER_PERSONA
+    assert type(persona) is str
+@
+
+<<test functions>>=
+def test_chosen_persona_falls_back_to_the_default():
+    assert cli._chosen_persona(None, None, "default") == "default"
 @
 
 <<test functions>>=
@@ -1808,6 +2056,7 @@ def _users_list_handler(
         bool,
         typer.Option(help="include deactivated accounts in output"),
     ] = False,
+    <<persona option>>
 ):
     """List users on the Zulip server.
 
@@ -1818,11 +2067,11 @@ def _users_list_handler(
     delivery email is empty -- shown as "(withheld)" on a terminal --
     when the server withholds it: seeing it requires organization
     administrator rights and a realm policy that permits it, so run
-    this with an admin's credentials (e.g. the user persona) to get
-    real addresses.
+    this with an admin's credentials (e.g. the user persona, `--as
+    user`) to get real addresses.
     """
     users_list_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             patterns=patterns,
             include_bots=include_bots,
@@ -2452,6 +2701,7 @@ def _users_invited_handler(
                  "(regex; repeat to OR several)",
         ),
     ] = None,
+    <<persona option>>
 ):
     """List pending (unaccepted) invitations.
 
@@ -2465,7 +2715,7 @@ def _users_invited_handler(
     that.
     """
     users_invited_command(
-        _get_user_client_from_context(ctx),
+        _get_user_client_from_context(ctx, persona=persona),
         SimpleNamespace(patterns=patterns),
     )
 @
@@ -2879,10 +3129,11 @@ def _users_invite_handler(
         ),
     ],
     <<invitation options>>
+    <<persona option>>
 ):
     """Invite one or more users to the Zulip organisation."""
     users_invite_command(
-        _get_user_client_from_context(ctx),
+        _get_user_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             emails=emails,
             <<invitation arguments>>
@@ -2890,9 +3141,13 @@ def _users_invite_handler(
     )
 @
 
-The option name [[--as]] reads naturally but [[as]] is a Python
-keyword, so the parameter has to be [[invite_as]] and the alias is
-wired explicitly.
+The role option is [[--role]]; the parameter behind it is
+[[invite_as]], after the API field the value is sent as, and the alias
+is wired explicitly because the two names differ.
+(Up to version 0.9 the flag was [[--as]]; it moved when [[--as]] became
+the persona option of \cref{sec:personas}, which every command takes.
+The move was forced rather than cosmetic: Click does not reject a
+duplicated option name, so the later definition would simply have won.)
 [[--add-default-streams]] needs no such wiring: Typer derives the
 paired [[--no-add-default-streams]] form from any boolean parameter,
 which is the same treatment [[--include-bots]] already gets.
@@ -2901,8 +3156,8 @@ which is the same treatment [[--include-bots]] already gets.
 invite_as: Annotated[
     InviteRole,
     typer.Option(
-        "--as",
-        "-a",
+        "--role",
+        "-r",
         help="organisation role assigned to invitees",
     ),
 ] = InviteRole.member,
@@ -3326,10 +3581,11 @@ signature.
 def _users_invite_link_handler(
     ctx: typer.Context,
     <<invitation options>>
+    <<persona option>>
 ):
     """Create a reusable invitation link."""
     users_invite_link_command(
-        _get_user_client_from_context(ctx),
+        _get_user_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             <<invitation arguments>>
         ),
@@ -3572,12 +3828,12 @@ def test_users_invite_link_cli_passes_options(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_user_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, [
         "users", "invite-link",
-        "--as", "guest",
+        "--role", "guest",
         "--expires-in", "60",
         "-s", "general",
         "--no-add-default-streams",
@@ -3703,10 +3959,11 @@ def _users_revoke_handler(
                  "several invitations",
         ),
     ] = False,
+    <<persona option>>
 ):
     """Revoke pending invitations."""
     users_revoke_command(
-        _get_user_client_from_context(ctx),
+        _get_user_client_from_context(ctx, persona=persona),
         SimpleNamespace(patterns=patterns, yes=yes),
     )
 @
@@ -3943,7 +4200,7 @@ def test_users_revoke_cli_passes_patterns_and_yes(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_user_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -3991,10 +4248,11 @@ def _users_resend_handler(
                  "several invitations",
         ),
     ] = False,
+    <<persona option>>
 ):
     """Resend pending email invitations."""
     users_resend_command(
-        _get_user_client_from_context(ctx),
+        _get_user_client_from_context(ctx, persona=persona),
         SimpleNamespace(patterns=patterns, yes=yes),
     )
 @
@@ -4102,7 +4360,7 @@ def test_users_resend_cli_passes_patterns_and_yes(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_user_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, ["users", "resend", "ann"])
@@ -4186,15 +4444,17 @@ def _send_handler(
         Optional[str],
         typer.Argument(help="message content (reads stdin if omitted)"),
     ] = None,
+    <<persona option>>
 ):
     """Send a message.
 
     The message is sent as the user persona when one is configured,
-    so it carries your name rather than the bot's; see the top-level
-    `--help` for how credentials are chosen.
+    so it carries your name rather than the bot's, unless `--as`
+    says otherwise; see the top-level `--help` for how credentials
+    are chosen.
     """
     send_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             stream=stream,
             topic=topic,
@@ -4654,7 +4914,7 @@ def test_send_cli_uses_stream_completion_and_dispatch(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: client,
+        lambda ctx, persona=None: client,
     )
 
     result = runner.invoke(
@@ -4862,10 +5122,11 @@ def _streams_handler(
             help="only show streams with unread messages",
         ),
     ] = False,
+    <<persona option>>
 ):
     """List available streams."""
     streams_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(patterns=patterns, unread=unread),
     )
 @
@@ -4941,7 +5202,7 @@ def test_streams_cli_passes_patterns_and_unread_flag(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, ["streams", "-U", "gen", "ann"])
@@ -5156,10 +5417,11 @@ def _topics_handler(
             help="only show topics with unread messages",
         ),
     ] = False,
+    <<persona option>>
 ):
     """List topics in a stream."""
     topics_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(stream=stream, unread=unread),
     )
 @
@@ -5225,7 +5487,7 @@ def test_topics_cli_passes_unread_flag(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, ["topics", "-U", "general"])
@@ -5392,10 +5654,11 @@ def _dm_handler(
             help="mark printed messages as read",
         ),
     ] = False,
+    <<persona option>>
 ):
     """Read direct messages."""
     dm_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             users=users,
             unread=unread,
@@ -5454,7 +5717,7 @@ def test_dm_cli_passes_users_unread_and_mark_as_read_flags(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -5740,10 +6003,11 @@ def _read_handler(
             help="mark printed messages as read",
         ),
     ] = False,
+    <<persona option>>
 ):
     """Read messages from a stream or topic."""
     read_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             stream=stream,
             topic=topic,
@@ -6998,10 +7262,11 @@ def _search_handler(
             help="print whole messages instead of one-line hits",
         ),
     ] = False,
+    <<persona option>>
 ):
     """Search message history."""
     search_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             query=query,
             stream=stream,
@@ -7031,7 +7296,7 @@ def test_search_cli_passes_query_and_scope_options(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, [
@@ -7587,10 +7852,11 @@ def _terms_handler(
             help="ignore terms seen fewer times than this",
         ),
     ] = 1,
+    <<persona option>>
 ):
     """Look up the vocabulary used in this Zulip realm."""
     terms_command(
-        _get_client_from_context(ctx),
+        _get_client_from_context(ctx, persona=persona),
         SimpleNamespace(
             query=query,
             limit=limit,
@@ -7706,7 +7972,7 @@ def test_terms_cli_passes_query_and_limits(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -7758,8 +8024,9 @@ would be reflowed into one run-on line with a stray continuation
 backslash.
 The docstring also states the credential exception of
 \cref{sec:personas}---the worker runs as the bot persona, never as
-the human---because the person whose unread messages are at stake is
-exactly the person reading [[bot --help]].
+the human unless asked with [[--as user]]---because the person whose
+unread messages are at stake is exactly the person reading
+[[bot --help]].
 
 The worker also needs the unread messages themselves.
 Some workers are easiest to drive with the plain text that [[read]]
@@ -7804,6 +8071,7 @@ def _bot_handler(
             help="format for unread messages written to worker stdin",
         ),
     ] = BotStdinFormat.read,
+    <<persona option>>
 ):
     """Run an external worker whenever unread messages are pending.
 
@@ -7817,14 +8085,15 @@ def _bot_handler(
     The worker authenticates with the bot persona (the
     `.bot`-suffixed sibling of the zuliprc in use, or
     `ZULIP_BOT_API_KEY` and `ZULIP_BOT_EMAIL`), falling back to the
-    plain zuliprc. It never runs as the user persona, so it cannot
-    consume your own unread messages.
+    plain zuliprc. It never runs as the user persona unless `--as
+    user` says so explicitly, so it cannot consume your own unread
+    messages by accident.
     """
     command = list(ctx.args)
     if not command:
         _exit_with_error("bot requires a worker command")
     bot_command(
-        _get_bot_client_from_context(ctx),
+        _get_bot_client_from_context(ctx, persona=persona),
         SimpleNamespace(command=command, stdin_format=stdin_format),
     )
 @
@@ -7844,7 +8113,7 @@ def test_bot_cli_passes_worker_command(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_bot_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -7856,6 +8125,28 @@ def test_bot_cli_passes_worker_command(monkeypatch):
     assert seen["client"] == "client"
     assert seen["args"].command == ["worker", "--flag", "value"]
     assert seen["args"].stdin_format == cli.BotStdinFormat.read
+@
+
+Now that [[--as]] is an option [[bot]] itself knows, the [[--]]
+contract matters more: a [[--as]] after it belongs to the worker.
+
+<<test functions>>=
+def test_bot_cli_leaves_the_workers_as_flag_alone(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(
+        cli, "bot_command", lambda client, args: seen.update(args=args),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_get_bot_client_from_context",
+        lambda ctx, persona=None: seen.update(persona=persona) or "client",
+    )
+
+    result = runner.invoke(app, ["bot", "--", "worker", "--as", "x"])
+
+    assert result.exit_code == 0
+    assert seen["args"].command == ["worker", "--as", "x"]
+    assert seen["persona"] is None
 @
 
 The enum-backed stdin-format option should also reach [[bot_command()]]
@@ -7873,7 +8164,7 @@ def test_bot_cli_passes_stdin_format(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_bot_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -9545,7 +9836,7 @@ def test_read_cli_passes_unread_and_mark_as_read_flags(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(
@@ -9576,7 +9867,7 @@ def test_read_cli_defaults_to_all_messages_without_marking(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, ["read", "general"])
@@ -9604,7 +9895,7 @@ def test_read_cli_allows_omitted_stream(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_get_client_from_context",
-        lambda ctx: "client",
+        lambda ctx, persona=None: "client",
     )
 
     result = runner.invoke(app, ["read", "-U"])
