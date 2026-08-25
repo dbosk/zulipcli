@@ -33,9 +33,21 @@ We chose not to cache the client as a module-level singleton because
 the CLI only creates one client per invocation anyway, and caching
 would complicate testing (stale state between test runs).
 
+The [[zulip]] library is deliberately absent from the module-level
+imports.
+Importing it pulls in [[requests]] and [[urllib3]], which costs on the
+order of 100~ms---and embedding hosts such as nytid import this package
+at \emph{their} import time, so a module-level [[import zulip]] here
+would tax every command of the host, not just the ones that talk to
+Zulip.
+Instead [[get_client]], the one function that needs the library,
+imports it on first call.
+Python caches modules in [[sys.modules]], so repeated calls resolve
+the name for free; the deferral costs nothing on the paths that do
+create a client and saves everything on the paths that never do.
+
 <<imports>>=
 import os
-import zulip
 @
 
 <<constants>>=
@@ -73,6 +85,8 @@ def get_client(zuliprc=None, *, api_key=None, email=None):
     Returns:
         A `zulip.Client` instance ready for API calls.
     """
+    import zulip
+
     if zuliprc is None:
         zuliprc = DEFAULT_ZULIPRC
     return zulip.Client(
