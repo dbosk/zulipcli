@@ -351,6 +351,19 @@ The `read` command expects Rich to be present for TTY Markdown
 rendering, and the CLI surface depends on Typer for subcommands and
 completion.
 
+`rich` and `zulip` are **imported lazily**, never at module level:
+rich inside the two TTY-only rendering branches (`_print_rows`,
+`_print_read_content`), zulip inside `_client_for_persona` and
+`get_client`. `import zulipcli.cli` must stay at typer-plus-stdlib
+cost because nytid calls `build_embedded_app()` at *its* import time,
+so a module-level import of rich/zulip/requests here slows every
+nytid command (issue #16). `test_import_cli_avoids_heavy_modules`
+guards this in a fresh subprocess — an in-process test cannot, since
+pytest has already imported the heavy modules. Consequence for tests:
+patch `rich.console.Console` / `rich.markdown.Markdown` (where the
+branches resolve the names at call time), not `cli.Console` — those
+module attributes no longer exist.
+
 The term index adds no packaging change: `sqlite3` (storage), `difflib`
 (similarity), and `os` (the `XDG_DATA_HOME` lookup) are all standard
 library. Keep it that way — a vocabulary cache is not worth a fourth
